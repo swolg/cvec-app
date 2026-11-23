@@ -38,7 +38,7 @@
     "@base-ui/react": "1.9.0",
     "@fontsource-variable/geist": "5.3.0",
     "@phosphor-icons/react": "2.1.10",
-    "@tauri-apps/api": "2.12.4",
+    "@tauri-apps/api": "2.12.5",
     "@visx/group": "4.0.1-alpha.0",
     "@visx/shape": "4.0.1-alpha.0",
     "@visx/text": "4.0.1-alpha.0",
@@ -58,7 +58,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",
-    "@tauri-apps/cli": "2.12.4",
+    "@tauri-apps/cli": "2.12.5",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",
     "@testing-library/user-event": "14.6.8",
