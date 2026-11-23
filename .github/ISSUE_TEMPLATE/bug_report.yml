@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a reproducible CVEC problem using a redacted or synthetic example.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a suspected security vulnerability, use **Security → Advisories → Report a vulnerability** instead. Never post credentials, private source, full databases or unredacted scan/chat logs here.
+  - type: input
+    id: revision
+    attributes:
+      label: Version / commit SHA
+      description: Give the commit SHA (or tag) of your Git checkout.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS version, Apple Silicon or Intel, Node/Rust, Syft/Grype versions and the selected provider/runtime version if relevant. Omit account details.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction, expected and actual behavior
+      description: Use a disposable example. Include a small redacted log or screenshot only if needed.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Public-report check
+      options:
+        - label: This is not a confidential security report, and I removed private data from the report and attachments.
+          required: true

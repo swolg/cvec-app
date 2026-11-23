@@ -1,0 +1,20 @@
+title = "cvec secret scanning policy"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Exact synthetic credentials used only by provider redaction tests"
+condition = "AND"
+regexTarget = "line"
+paths = [
+  '''^src-tauri/src/core/companion_host\.rs$''',
+  '''^src-tauri/tests/fixtures/fake_codex_app_server\.py$''',
+]
+regexes = [
+  '''Bearer account-expired-secret''',
+  '''Bearer secret-token-value''',
+  '''sk-fixture-never-persist-or-log''',
+  '''sk-fixture-secret-value''',
+]
+

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "allowedRegistries": [
+    "https://registry.npmjs.org/"
+  ],
+  "allowedLifecycleScripts": [],
+  "allowedAdvisories": [
+    "GHSA-wrw7-89jp-8q8g",
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0429",
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+    "RUSTSEC-2026-0543"
+  ],
+  "releaseAgeDays": 7,
+  "actionPinLength": 40,
+  "reviewRequired": {
+    "majorUpdates": true,
+    "packagesWithLifecycleScripts": true
+  }
+}

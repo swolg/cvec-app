@@ -1,0 +1,15 @@
+name: Feature request
+description: Describe a concrete local-first workflow or improvement.
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and intended outcome
+      description: Describe the workflow, who needs it and an example without private repository data.
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: Suggested approach and alternatives
+      description: Explain any source sharing, network access, provider requirements or local data changes.

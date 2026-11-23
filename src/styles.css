@@ -1,0 +1,504 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "./styles/primitives.css";
+@import "./styles/themes.css";
+@import "./styles/components.css";
+@import "./styles/motion.css";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+    --font-sans: "Geist Variable", sans-serif;
+
+    --color-background: var(--background);
+    --color-foreground: var(--foreground);
+    --color-card: var(--card);
+    --color-card-foreground: var(--card-foreground);
+    --color-popover: var(--popover);
+    --color-popover-foreground: var(--popover-foreground);
+    --color-primary: var(--primary);
+    --color-primary-foreground: var(--primary-foreground);
+    --color-secondary: var(--secondary);
+    --color-secondary-foreground: var(--secondary-foreground);
+    --color-muted: var(--muted);
+    --color-muted-foreground: var(--muted-foreground);
+    --color-accent: var(--accent);
+    --color-accent-foreground: var(--accent-foreground);
+    --color-destructive: var(--destructive);
+    --color-border: var(--border);
+    --color-input: var(--input);
+    --color-ring: var(--ring);
+    --color-canvas: var(--canvas);
+    --color-surface-1: var(--surface-1);
+    --color-surface-2: var(--surface-2);
+    --color-surface-3: var(--surface-3);
+    --color-surface-4: var(--surface-4);
+    --color-hairline: var(--hairline);
+    --color-hairline-strong: var(--hairline-strong);
+    --color-hairline-tertiary: var(--hairline-tertiary);
+    --color-ink: var(--ink);
+    --color-ink-muted: var(--ink-muted);
+    --color-ink-subtle: var(--ink-subtle);
+    --color-ink-tertiary: var(--ink-tertiary);
+    --color-primary-hover: var(--primary-hover);
+    --color-primary-focus: var(--primary-focus);
+    --color-severity-critical: var(--severity-critical);
+    --color-severity-high: var(--severity-high);
+    --color-severity-medium: var(--severity-medium);
+    --color-severity-low: var(--severity-low);
+    --color-status-success: var(--status-success);
+    --color-shell-chrome: var(--shell-chrome);
+    --color-navigation-surface: var(--navigation-surface);
+    --color-content-canvas: var(--content-canvas);
+    --color-panel-surface: var(--panel-surface);
+    --color-control-surface: var(--control-surface);
+    --color-chart-surface: var(--chart-surface);
+    --color-row-hover-surface: var(--row-hover-surface);
+    --color-row-selected-surface: var(--row-selected-surface);
+    --color-navigation-active-surface: var(--navigation-active-surface);
+    --color-navigation-active-border: var(--navigation-active-border);
+    --color-panel-hairline: var(--panel-hairline);
+
+    --radius-sm: calc(var(--radius) - 4px);
+    --radius-md: calc(var(--radius) - 2px);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) + 4px);
+    --font-heading: var(--font-sans);
+    --color-sidebar-ring: var(--sidebar-ring);
+    --color-sidebar-border: var(--sidebar-border);
+    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+    --color-sidebar-accent: var(--sidebar-accent);
+    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+    --color-sidebar-primary: var(--sidebar-primary);
+    --color-sidebar-foreground: var(--sidebar-foreground);
+    --color-sidebar: var(--sidebar);
+    --color-chart-5: var(--chart-5);
+    --color-chart-4: var(--chart-4);
+    --color-chart-3: var(--chart-3);
+    --color-chart-2: var(--chart-2);
+    --color-chart-1: var(--chart-1);
+    --radius-2xl: calc(var(--radius) * 1.8);
+    --radius-3xl: calc(var(--radius) * 2.2);
+    --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+    --shell-topbar-height: 48px;
+    --shell-sidebar-width: 228px;
+    --window-controls-inset: 12px;
+}
+
+:root[data-window-platform="macos"] {
+    --window-controls-inset: 88px;
+}
+
+@layer base {
+    * {
+        @apply border-border outline-ring/50;
+    }
+
+    html,
+    body,
+    #root {
+        height: 100%;
+        min-height: 100%;
+        background: var(--canvas);
+        overflow: hidden;
+    }
+
+    body {
+        @apply antialiased bg-background text-foreground;
+        background: var(--canvas);
+    }
+    html {
+        @apply font-sans;
+    }
+
+    html[data-review-pointer-phase="armed-card"],
+    html[data-review-pointer-phase="armed-card"] * {
+        cursor: pointer !important;
+    }
+
+    html[data-review-pointer-phase="armed-handle"],
+    html[data-review-pointer-phase="armed-handle"] *,
+    html[data-review-pointer-phase="dragging"],
+    html[data-review-pointer-phase="dragging"] * {
+        cursor: grabbing !important;
+    }
+
+    html[data-review-pointer-phase="armed-card"],
+    html[data-review-pointer-phase="armed-card"] *,
+    html[data-review-pointer-phase="armed-handle"],
+    html[data-review-pointer-phase="armed-handle"] *,
+    html[data-review-pointer-phase="dragging"],
+    html[data-review-pointer-phase="dragging"] * {
+        user-select: none !important;
+        -webkit-user-select: none !important;
+    }
+}
+
+@layer components {
+    .app-shell {
+        background: var(--canvas);
+        /* AppKit owns the outer frame, corners and shadow. */
+        border: 0;
+        box-shadow: none;
+        border-radius: 0;
+        isolation: isolate;
+    }
+
+    .app-topbar {
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        border-bottom: 1px solid var(--hairline-tertiary);
+    }
+
+    .app-topbar-sidebar {
+        background: var(--navigation-surface);
+        border-color: var(--hairline);
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    .app-topbar-content {
+        background: var(--shell-chrome);
+        border-left: 1px solid var(--hairline-tertiary);
+        user-select: none;
+        -webkit-user-select: none;
+    }
+
+    .app-sidebar {
+        background: var(--navigation-surface);
+        border-color: var(--hairline);
+        border-right: 1px solid var(--hairline-tertiary);
+    }
+
+    .app-content {
+        background: var(--content-canvas);
+    }
+
+    .app-panel {
+        background: var(--panel-surface);
+        border-color: var(--panel-hairline);
+    }
+
+    .app-surface {
+        background: var(--control-surface);
+        border-color: var(--hairline);
+    }
+
+    .dashboard-grid {
+        min-height: 24rem;
+    }
+
+    .dashboard-grid .react-grid-item {
+        transition:
+            transform 160ms ease,
+            width 160ms ease,
+            height 160ms ease;
+    }
+
+    .dashboard-grid .react-grid-item.react-grid-placeholder {
+        border-radius: var(--radius-lg);
+        background: var(--primary-soft);
+        opacity: 1;
+        border: 2px dashed var(--primary);
+        z-index: 1;
+    }
+
+    .dashboard-grid .react-resizable-handle {
+        z-index: 12;
+        width: 26px;
+        height: 26px;
+        border-radius: var(--radius-md);
+        background: var(--surface-3);
+        border: 1px solid var(--hairline);
+        opacity: 1;
+    }
+
+    .dashboard-grid-item,
+    .dashboard-widget-frame {
+        min-width: 0;
+        min-height: 0;
+    }
+
+    .dashboard-widget-frame {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .dashboard-widget-content {
+        flex: 1;
+        min-height: 0;
+        min-width: 0;
+    }
+
+    .dashboard-widget-content > * {
+        height: 100%;
+    }
+
+    .dashboard-widget-controls {
+        display: flex;
+        align-items: center;
+        flex: 0 0 40px;
+        gap: 4px;
+        padding: 3px 8px;
+        border: 1px solid var(--hairline);
+        border-bottom: 0;
+        border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+        background: var(--surface-2);
+        user-select: none;
+    }
+
+    .dashboard-grid-editing .dashboard-widget-content > * {
+        border-top-left-radius: 0;
+        border-top-right-radius: 0;
+    }
+
+    .dashboard-widget-control {
+        flex-shrink: 0;
+        color: var(--ink-muted);
+    }
+
+    .dashboard-grid-editing {
+        background-image: radial-gradient(var(--hairline-strong) 1px, transparent 1px);
+        background-size: 16px 16px;
+    }
+
+    .dashboard-grid .react-grid-item.react-draggable-dragging,
+    .dashboard-grid .react-grid-item.resizing {
+        z-index: 30;
+        outline: 2px solid var(--primary);
+    }
+
+    .dashboard-drag-handle {
+        cursor: grab;
+    }
+
+    .dashboard-drag-handle:active {
+        cursor: grabbing;
+    }
+
+    .dashboard-picker-scrim {
+        position: fixed;
+        inset: var(--shell-topbar-height) 0 0 var(--shell-sidebar-width);
+        z-index: 60;
+        display: flex;
+        align-items: flex-start;
+        justify-content: flex-end;
+        padding: 16px 20px;
+        background: color-mix(in srgb, var(--overlay) 45%, transparent);
+    }
+
+    .dashboard-picker {
+        width: min(720px, 100%);
+        max-height: min(720px, calc(100vh - var(--shell-topbar-height) - 32px));
+        overflow: auto;
+    }
+
+    .dashboard-chart-label {
+        fill: var(--ink-subtle);
+        font-family: var(--font-sans);
+        font-size: 11px;
+    }
+
+    .dashboard-quadrant-kicker {
+        fill: var(--status-critical);
+        font-family: var(--font-sans);
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+    }
+
+    @media (max-width: 767px) {
+        .dashboard-picker-scrim {
+            inset: var(--shell-topbar-height) 0 0 0;
+            padding: 12px;
+        }
+    }
+
+    .app-surface-muted {
+        background: var(--surface-3);
+        border-color: var(--hairline);
+    }
+
+    .app-text-primary {
+        color: var(--ink);
+    }
+
+    .app-text-body {
+        color: var(--ink-muted);
+    }
+
+    .app-text-muted {
+        color: var(--ink-subtle);
+    }
+
+    .finding-detail-overlay {
+        background: var(--overlay);
+        backdrop-filter: blur(1.5px);
+        -webkit-backdrop-filter: blur(1.5px);
+    }
+
+    .finding-detail-drawer {
+        background: var(--surface-1);
+        border-color: var(--hairline);
+        box-shadow: none;
+    }
+
+    .finding-detail-header {
+        background: var(--surface-1);
+        border-color: var(--hairline);
+    }
+
+    .finding-detail-card {
+        background: var(--surface-2);
+        border-color: var(--hairline);
+    }
+
+    .finding-detail-card-muted,
+    .finding-detail-metric {
+        background: var(--surface-3);
+        border-color: var(--hairline);
+    }
+
+    .app-nav-item {
+        color: var(--ink-subtle);
+        border: 1px solid transparent;
+        background: transparent;
+    }
+
+    .app-nav-item:hover {
+        background: var(--surface-2);
+        border-color: var(--hairline);
+        color: var(--ink);
+    }
+
+    .app-nav-item-active {
+        background: var(--navigation-active-surface);
+        border-color: var(--navigation-active-border);
+        color: var(--ink);
+    }
+
+    .app-count-pill {
+        background: var(--surface-2);
+        border-color: var(--hairline);
+        color: var(--ink-subtle);
+    }
+
+    .app-count-pill-warning {
+        background: var(--status-high-soft);
+        border-color: color-mix(in srgb, var(--status-high) 28%, transparent);
+        color: var(--status-high);
+    }
+
+
+}
+
+
+.dashboard-grid-editing .react-grid-item > .react-resizable-handle {
+    opacity: 1 !important;
+}
+
+@media (max-width: 800px) {
+    :root {
+        --shell-sidebar-width: 64px;
+    }
+
+    :root[data-window-platform="macos"] {
+        --shell-sidebar-width: 80px;
+    }
+
+    .app-sidebar .sidebar-item-label,
+    .app-sidebar .sidebar-item-count,
+    .app-sidebar .sidebar-section-label,
+    .app-topbar-sidebar > span {
+        display: none;
+    }
+
+    .app-sidebar [data-slot="button"] {
+        justify-content: center;
+        padding-inline: 0;
+    }
+
+    .app-topbar-sidebar {
+        justify-content: center;
+        padding-inline: 0;
+    }
+
+    :root[data-window-platform="macos"] .app-topbar-sidebar > img {
+        display: none;
+    }
+}
+
+.repository-detail-pane { container-type: inline-size; container-name: repository-detail; }
+.repository-evidence-metrics { grid-template-columns: repeat(2,minmax(0,1fr)); }
+@container repository-detail (min-width: 780px) { .repository-evidence-metrics { grid-template-columns: repeat(4,minmax(0,1fr)); } }
+@container repository-detail (max-width: 380px) { .repository-evidence-metrics { grid-template-columns: minmax(0,1fr); } }
+
+/* Wrapped controls must not collapse the virtualized result viewport at zoom. */
+@media (max-height: 640px) {
+  .review-workspace { overflow-y: auto; }
+  .review-result-region { flex: 1 0 16rem; min-height: 16rem; }
+  .chat-composer-hint { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  /* Keep the conversation readable beside the fixed composer. Workspace
+     metadata stays available in its own keyboard-scrollable header. */
+  .fix-workspace-header { max-height: 25%; }
+}
+
+@media (max-height: 640px) {
+  .chat-workspace-viewport { padding: 8px; }
+  .chat-compact-selector { padding-block: 4px; }
+  .chat-compact-selector > button { min-height: 32px; height: 32px; }
+  .chat-mode-shell > div:first-child { padding-top: 0; }
+  .chat-mode-shell > div:first-child [role="tab"] { min-height: 32px; height: 32px; }
+  .chat-conversation-header { padding-block: 6px; }
+  .chat-composer textarea { min-height: 36px; }
+}
+
+@media (max-width: 79.999rem) and (max-height: 640px) {
+  .chat-conversation-breadcrumb { display: none; }
+  .chat-conversation-meta { margin-top: 0; }
+}
+
+/* Chat owns its scrolling. At 200% zoom the viewport can be only ~280 CSS
+   pixels tall; repeated headers must leave room for reading and composing. */
+@media (max-height: 420px) {
+  .app-shell:has([data-active-workspace="chat"]) { --shell-topbar-height: 32px; }
+  .app-shell:has([data-active-workspace="chat"]) .app-topbar button { height: 24px; min-height: 24px; max-height: 24px; }
+  .app-shell:has([data-active-workspace="chat"]) .app-topbar [data-slot="icon-button"] { width: 24px; }
+  .chat-workspace-viewport { padding: 4px; }
+  .chat-compact-selector { gap: 4px; padding: 2px 4px; }
+  .chat-compact-selector > button { height: 28px; min-height: 28px; max-height: 28px; }
+  .chat-mode-shell > div:first-child { padding: 0 6px; }
+  .chat-mode-shell [role="tablist"] { min-height: 24px; flex-wrap: nowrap; gap: 12px; overflow-x: auto; }
+  .chat-mode-shell [role="tab"] { flex: 0 0 auto; min-width: max-content; height: 24px; min-height: 24px; max-height: 24px; padding: 2px 6px; }
+  .chat-conversation-header { padding: 3px 6px; }
+  /* The compact selector already shows the repository and conversation. */
+  .chat-conversation-breadcrumb { display: none; }
+  .chat-conversation-meta { margin-top: 0; gap: 4px; }
+  .chat-conversation-meta [data-slot="badge"] { padding: 1px 4px; }
+  .chat-conversation-meta button { height: auto; min-height: 24px; padding: 2px 4px; }
+  .chat-conversation-header > div { align-items: center; gap: 4px; }
+  .chat-conversation-header button { height: 24px; min-height: 24px; max-height: 24px; }
+  .chat-conversation-header [data-slot="icon-button"] { width: 24px; }
+  .chat-composer { padding: 4px 6px; }
+  .chat-composer-input { padding: 2px 6px 4px; }
+  .chat-composer-toolbar { gap: 4px; padding-top: 0; }
+  .chat-composer-toolbar button { height: 28px; min-height: 28px; max-height: 28px; padding-block: 0; }
+  .chat-composer-toolbar [data-slot="icon-button"] { width: 28px; }
+  .chat-composer-toolbar .chat-model-picker { max-width: 40%; }
+  .chat-composer textarea { display: block; min-height: 28px; max-height: 44px; padding-block: 2px; line-height: 20px; }
+  .chat-composer-status { min-height: 14px; margin-top: 2px; font-size: 10px; line-height: 14px; }
+  .chat-composer-length-note { margin-top: 2px; font-size: 10px; line-height: 14px; }
+  .chat-composer-status > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fix-workspace-header { min-height: 32px; max-height: 32px; padding: 4px 6px; }
+  .fix-workspace-header > div:first-child { flex-wrap: nowrap; gap: 4px; }
+  .fix-workspace-header > div:first-child > h2 { flex: 1; }
+  .fix-workspace-header > div:first-child > button { height: 24px; min-height: 24px; padding-block: 0; }
+  .chat-empty-state { gap: 4px; padding: 0 4px; }
+  .chat-timeline-content { padding-block: 4px; }
+  .chat-timeline-content button { min-height: 24px; }
+  .chat-timeline-content button[aria-label="Copy answer as Markdown"] { height: 24px; }
+}
