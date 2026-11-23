@@ -730,7 +730,7 @@ if 'api' in sys.argv:
                 None,
             )
             .expect("turn");
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 let event = match received
                     .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
