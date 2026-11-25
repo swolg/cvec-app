@@ -9,12 +9,13 @@ use crate::core::{
     external_intel, github, github_advisory,
     github_auth::{GithubLoginPollResult, GithubLoginStart, GithubRepositoryOption},
     models::{
-        AppNotificationKind, AppNotificationTone, AppSnapshot, ExternalIntelDetail,
-        ExternalIntelFeed, GrypeDbStatus, GrypeDbUpdateOutcome, GrypeDbUpdateSummary,
-        LocalEntityResult, OnboardingStatus, RepoRecord, RepoSourceType, ReviewActionBasis,
-        ReviewPage, ReviewQuery, ReviewUpdate, RiskTrendPoint, ScanActivity, ScanActivityStage,
-        ScanActivityStatus, ScanAllResult, ScanAllSummary, ScanOutput, ScanRepositoryOutcome,
-        ScannerVersions, ScheduleInterval, SnoozeFindingInput, SourceSnapshot,
+        AppNotificationKind, AppNotificationTone, AppSnapshot, ArtifactFindings, ArtifactScan,
+        ArtifactScanKind, ExternalIntelDetail, ExternalIntelFeed, GrypeDbStatus,
+        GrypeDbUpdateOutcome, GrypeDbUpdateSummary, LocalEntityResult, OnboardingStatus,
+        RepoRecord, RepoSourceType, ReviewActionBasis, ReviewPage, ReviewQuery, ReviewUpdate,
+        RiskTrendPoint, ScanActivity, ScanActivityStage, ScanActivityStatus, ScanAllResult,
+        ScanAllSummary, ScanOutput, ScanRepositoryOutcome, ScannerVersions, ScheduleInterval,
+        SnoozeFindingInput, SourceSnapshot,
     },
     repo_discovery, scanner, url_policy,
 };
@@ -123,6 +124,88 @@ pub async fn list_repository_assets(
             .0
             .db
             .list_repository_assets(repo_id)
+            .map_err(|cause| cause.to_string())
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn list_artifact_scans(
+    state: State<'_, SharedState>,
+    repo_id: i64,
+) -> Result<Vec<ArtifactScan>, String> {
+    let db = state.0.db.clone();
+    crate::runtime::run(move || {
+        db.list_artifact_scans(repo_id)
+            .map_err(|cause| cause.to_string())
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn get_artifact_findings(
+    state: State<'_, SharedState>,
+    repo_id: i64,
+    scan_id: i64,
+    offset: u32,
+) -> Result<ArtifactFindings, String> {
+    let db = state.0.db.clone();
+    crate::runtime::run(move || {
+        db.artifact_findings(repo_id, scan_id, offset)
+            .map_err(|cause| cause.to_string())
+    })
+    .await?
+}
+
+#[tauri::command]
+pub async fn scan_artifact(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+    repo_id: i64,
+    kind: ArtifactScanKind,
+) -> Result<Option<ArtifactScan>, String> {
+    let shared = state.inner().clone();
+    let repo = repository_for_scan(&shared, repo_id)
+        .await
+        .map_err(|cause| cause.to_string())?;
+    let _guard = shared
+        .try_acquire_scan()
+        .map_err(|cause| cause.to_string())?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let picker = app.dialog().file();
+    let picker = if repo.source_type == RepoSourceType::Local {
+        picker.set_directory(&repo.path)
+    } else {
+        picker
+    };
+    let select = move |selection: Option<tauri_plugin_dialog::FilePath>| {
+        let _ = sender.send(selection.map(|path| path.into_path()));
+    };
+    match kind {
+        ArtifactScanKind::BuildFolder => picker
+            .set_title("Choose a build folder or OCI image layout")
+            .pick_folder(select),
+        ArtifactScanKind::BuildFile => picker
+            .set_title("Choose a build file or container image archive")
+            .pick_file(select),
+        ArtifactScanKind::Sbom => picker
+            .set_title("Choose a Syft, CycloneDX or SPDX SBOM")
+            .pick_file(select),
+    }
+    let Some(path) = receiver
+        .await
+        .map_err(|_| "Artifact selection was interrupted".to_owned())?
+    else {
+        return Ok(None);
+    };
+    let path = path.map_err(|cause| cause.to_string())?;
+    let (summary, findings) = scanner::scan_artifact(path, kind, &shared.grype_db_cache_dir())
+        .await
+        .map_err(|cause| cause.to_string())?;
+    let db = shared.0.db.clone();
+    crate::runtime::run(move || {
+        db.record_artifact_scan(repo_id, summary, &findings)
+            .map(Some)
             .map_err(|cause| cause.to_string())
     })
     .await?
@@ -1246,7 +1329,7 @@ async fn persist_prepared_scan(
     repo: RepoRecord,
     run_id: i64,
     prepared: PreparedScanRoot,
-    output: ScanOutput,
+    mut output: ScanOutput,
 ) -> Result<(ScanReviewChanges, bool), Error> {
     let repo_id = repo.id;
     let (assets, prepared) = crate::runtime::run_io(move || {
@@ -1255,7 +1338,10 @@ async fn persist_prepared_scan(
     })
     .await
     .map_err(Error::App)?;
-    if let Some(evidence) = &output.evidence {
+    if let Some(evidence) = output.evidence.as_mut() {
+        if let PreparedScanRoot::Github(repository) = &prepared {
+            evidence.record_coverage_gaps(repository.coverage_gaps.iter().cloned());
+        }
         evidence.verify_source(prepared.path()).await?;
     }
     let source_snapshot = prepared.source_snapshot();
@@ -1808,6 +1894,7 @@ mod tests {
                     fix_version: None,
                     title: None,
                     source_url: None,
+                    match_evidence: None,
                     advisory_details: None,
                 }],
                 packages: vec![RepoPackage {

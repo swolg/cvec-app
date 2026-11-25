@@ -418,7 +418,158 @@ snapshots:
     empty.scan(&cache, &versions, async |_| {}).await.unwrap();
     assert!(empty.detail().packages.is_empty());
     assert!(empty.detail().findings.is_empty());
-    for repo in [&npm, &cargo, &python, &linked, &pnpm, &empty] {
+
+    let dotnet = TestRepo::new(root, "dotnet");
+    dotnet.write("Example.csproj", "<Project Sdk='Microsoft.NET.Sdk'/>");
+    let resolution = serde_json::json!({
+        "version": 3,
+        "project": {"restore": {
+            "projectPath": dotnet.path.join("Example.csproj"),
+            "outputPath": dotnet.path.join("obj"),
+            "frameworks": {"net8.0": {}}
+        }},
+        "libraries": {"Newtonsoft.Json/12.0.3": {"type":"package"}},
+        "targets": {"net8.0": {"Newtonsoft.Json/12.0.3": {"type":"package"}}}
+    });
+    dotnet.write("obj/project.assets.json", &resolution.to_string());
+    dotnet.scan(&cache, &versions, async |_| {}).await.unwrap();
+    let baseline = dotnet.detail();
+    assert!(baseline
+        .packages
+        .iter()
+        .any(|package| package.name == "Newtonsoft.Json"
+            && package.version.as_deref() == Some("12.0.3")));
+    assert!(baseline
+        .findings
+        .iter()
+        .any(|finding| finding.package_name.eq_ignore_ascii_case("Newtonsoft.Json")));
+    fs::File::open(dotnet.path.join("Example.csproj"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+        .unwrap();
+    let error = dotnet
+        .scan(&cache, &versions, async |_| {})
+        .await
+        .unwrap_err();
+    assert_preserved(&dotnet, &baseline, error, "scan scope changed");
+
+    dotnet.write("Example.csproj", r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="[13.0.3]" /></ItemGroup></Project>"#);
+    dotnet.write("obj/project.assets.json", &resolution.to_string());
+    let error = dotnet
+        .scan(&cache, &versions, async |_| {})
+        .await
+        .unwrap_err();
+    assert_preserved(&dotnet, &baseline, error, "scan scope changed");
+
+    let manifests = TestRepo::new(root, "dotnet-manifest");
+    manifests.write("tool/Example.csproj", r#"<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include="Newtonsoft.Json" /></ItemGroup></Project>"#);
+    manifests.write("Directory.Packages.props", r#"<Project><PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup><ItemGroup><PackageVersion Include="Newtonsoft.Json" Version="12.0.3" /></ItemGroup></Project>"#);
+    manifests
+        .scan(&cache, &versions, async |_| {})
+        .await
+        .unwrap();
+    let db = Database::new(manifests.database.clone()).unwrap();
+    let raw = db.repo_overview(manifests.repo.id).unwrap();
+    assert!(raw.findings.is_empty());
+    assert_eq!(
+        raw.nuget_projects[0].declarations[0].requirement.as_deref(),
+        Some("12.0.3")
+    );
+    assert!(raw.nuget_projects[0].resolution_path.is_none());
+    assert!(raw
+        .overview
+        .latest_completed_scan
+        .unwrap()
+        .coverage_warnings[0]
+        .contains("project.assets.json"));
+
+    manifests.write("tool/packages.Example.lock.json", r#"{"version":1,"dependencies":{"net8.0":{"Newtonsoft.Json":{"type":"Direct","resolved":"12.0.3"}}}}"#);
+    manifests
+        .scan(&cache, &versions, async |_| {})
+        .await
+        .unwrap();
+    let verified = db.repo_overview(manifests.repo.id).unwrap();
+    assert_eq!(
+        verified.nuget_projects[0].resolution_path.as_deref(),
+        Some("tool/packages.Example.lock.json")
+    );
+    assert!(verified
+        .findings
+        .iter()
+        .any(|finding| finding.package_name.eq_ignore_ascii_case("Newtonsoft.Json")));
+    assert!(verified
+        .overview
+        .latest_completed_scan
+        .unwrap()
+        .coverage_warnings
+        .is_empty());
+
+    let build = root.join("build");
+    let installed = build.join("node_modules/lodash");
+    fs::create_dir_all(&installed).unwrap();
+    fs::write(
+        installed.join("package.json"),
+        r#"{"name":"lodash","version":"4.17.20"}"#,
+    )
+    .unwrap();
+    let (build_scan, build_findings) =
+        scanner::scan_artifact(build.clone(), ArtifactScanKind::BuildFolder, &cache)
+            .await
+            .unwrap();
+    assert_eq!(build_scan.package_count, 1);
+    assert!(build_scan.coverage_warnings.is_empty());
+    assert!(build_findings.len() >= 4);
+    assert!(build_findings
+        .iter()
+        .all(|finding| finding
+            .match_evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.kind
+                != crate::core::models::FindingMatchKind::LocalInstallation)));
+    let saved_db = Database::new(empty.database.clone()).unwrap();
+    let saved = saved_db
+        .record_artifact_scan(empty.repo.id, build_scan, &build_findings)
+        .unwrap();
+    assert_eq!(
+        saved_db.list_artifact_scans(empty.repo.id).unwrap(),
+        vec![saved.clone()]
+    );
+    assert_eq!(
+        saved_db
+            .artifact_findings(empty.repo.id, saved.id, 0)
+            .unwrap()
+            .findings,
+        build_findings
+    );
+    assert!(empty.detail().findings.is_empty());
+
+    let output = Command::new("syft")
+        .args([
+            "scan",
+            "-q",
+            "--override-default-catalogers=image",
+            "-o",
+            "cyclonedx-json",
+        ])
+        .arg(&build)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let sbom = root.join("build.cdx.json");
+    fs::write(&sbom, &output.stdout).unwrap();
+    let (import, matches) = scanner::scan_artifact(sbom, ArtifactScanKind::Sbom, &cache)
+        .await
+        .unwrap();
+    assert_eq!(import.package_count, 1);
+    assert_eq!(
+        import.digest,
+        crate::core::hashing::sha256_hex(&output.stdout)
+    );
+    assert_eq!(matches.len(), build_findings.len());
+
+    for repo in [
+        &npm, &cargo, &python, &linked, &pnpm, &empty, &dotnet, &manifests,
+    ] {
         let db = rusqlite::Connection::open(&repo.database).unwrap();
         let integrity: String = db
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))

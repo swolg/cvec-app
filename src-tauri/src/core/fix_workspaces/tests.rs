@@ -2316,6 +2316,7 @@ done
         title: None,
         source_url: None,
         package_url: Some("pkg:npm/fixture-package@1.0.0".into()),
+        match_evidence: None,
         advisory_details: None,
     }];
     let versions = ScannerVersions {

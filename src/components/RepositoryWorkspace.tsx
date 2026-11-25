@@ -15,7 +15,9 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { ListBox, ListBoxItem } from "react-aria-components/ListBox";
 import { ListLayout, Virtualizer } from "react-aria-components/Virtualizer";
 
+import { RepositoryArtifacts } from "./RepositoryArtifacts";
 import { RepositoryDependencies } from "./RepositoryDependencies";
+import { RepositoryNugetProjects } from "./RepositoryNugetProjects";
 import { RepositoryProducts } from "./RepositoryProducts";
 import { RepositoryScanHistory } from "./RepositoryScanHistory";
 import { AppIcon } from "@/components/ui/app-icon";
@@ -27,7 +29,8 @@ import { SearchField, Select, Tabs } from "@/components/ui/form-controls";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/components/ui/overlays";
 import { getRepoOverview, removeRemoteRepository } from "@/lib/api";
 import { formatRelativeTimestamp, formatTimestamp } from "@/lib/format";
-import { deriveRepositoryMonitoring, RepositoryOverviewCache } from "@/lib/repositoryWorkspace";
+import { bundledToolLabel } from "@/lib/findingMatch";
+import { deriveRepositoryMonitoring, formatCoverageWarning, RepositoryOverviewCache } from "@/lib/repositoryWorkspace";
 import type {
   AppSnapshot,
   RemediationOpportunity,
@@ -42,7 +45,7 @@ import type {
   Severity,
 } from "@/lib/types";
 
-export type DetailTab = "overview" | "dependencies" | "history" | "settings";
+export type DetailTab = "overview" | "dependencies" | "history" | "artifacts" | "settings";
 type InventorySort = "attention" | "freshness" | "changes" | "name";
 
 interface RepositoryWorkspaceProps {
@@ -423,10 +426,12 @@ function RepositoryDetail({ detail, dependencyRevision, refreshingInventory, sel
         </div>
         <p className="mt-2 text-xs text-ink-subtle">{monitoring.reason}</p>
       </header>
-      <div className="shrink-0 border-b border-hairline px-4 pt-2"><Tabs label="Repository sections" value={tab} onValueChange={onTabChange} options={[{ value: "overview", label: "Overview" }, { value: "dependencies", label: "Dependencies" }, { value: "history", label: "Scan history" }, { value: "settings", label: "Source" }]} /></div>
+      <div className="shrink-0 overflow-x-auto border-b border-hairline px-4 pt-2"><Tabs label="Repository sections" value={tab} onValueChange={onTabChange} options={[{ value: "overview", label: "Overview" }, { value: "dependencies", label: "Dependencies" }, { value: "history", label: "Scan history" }, { value: "artifacts", label: "Artifacts" }, { value: "settings", label: "Source" }]} /></div>
       <div data-repository-scroll onScroll={(event) => onScroll(event.currentTarget.scrollTop)} className="min-h-0 min-w-0 flex-1 overflow-y-auto p-4 [scrollbar-gutter:stable]">
         {tab === "overview" ? <Overview detail={detail} lastSuccessfulScan={lastSuccessfulScan} monitoring={monitoring} onOpenReview={(pkg, fingerprint, group) => openReview("overview", pkg, fingerprint, group)} /> : null}
         {tab === "dependencies" ? lastSuccessfulScan ? (
+          <>
+          {detail.nugetProjects?.length ? <RepositoryNugetProjects key={lastSuccessfulScan.id} projects={detail.nugetProjects} /> : null}
           <RepositoryDependencies
             key={`${selectedRepo.id}:${packageLinkSequence ?? 0}`}
             packageLinkSequence={packageLinkSequence}
@@ -446,6 +451,7 @@ function RepositoryDetail({ detail, dependencyRevision, refreshingInventory, sel
               origin: { repositoryId: selectedRepo.id, section: "dependencies" },
             })}
           />
+          </>
         ) : <EmptyState icon={Package} title="No completed scan yet" description="Run a repository scan to see its dependencies." /> : null}
         {tab === "history" ? <RepositoryScanHistory
           key={selectedRepo.id}
@@ -458,6 +464,7 @@ function RepositoryDetail({ detail, dependencyRevision, refreshingInventory, sel
             origin: { repositoryId: selectedRepo.id, section: "history" },
           })}
         /> : null}
+        {tab === "artifacts" ? <RepositoryArtifacts key={selectedRepo.id} repoId={selectedRepo.id} canScan={scannerReady && !isScanning && !removing} /> : null}
         {tab === "settings" ? <RepositorySource detail={detail} /> : null}
       </div>
     </div>
@@ -477,9 +484,17 @@ function Overview({ detail, lastSuccessfulScan, monitoring, onOpenReview }: { de
         <EvidenceMetric label="Since comparison" value={`+${totalNew(detail.summary)} / −${totalResolved(detail.summary)}`} detail={detail.previousScan ? "New / resolved findings" : "Baseline scan"} />
         <EvidenceMetric label="Scanned revision" value={shortSha(lastSuccessfulScan.sourceRevision) ?? "Not recorded"} detail={detail.summary.sourceType === "github" && detail.summary.lastRemoteCommitSha ? "Latest known on GitHub · " + shortSha(detail.summary.lastRemoteCommitSha) : lastSuccessfulScan.sourceDirty ? "Includes local changes" : undefined} />
       </section>
+      {lastSuccessfulScan.coverageWarnings?.length ? (
+        <section className="rounded-lg border border-hairline bg-surface-1 px-4 py-3">
+          <h3 className="text-sm font-semibold text-ink">Incomplete package coverage</h3>
+          <ul className="mt-2 list-disc space-y-1 break-words pl-4 text-xs text-ink-subtle">
+            {lastSuccessfulScan.coverageWarnings.map((warning) => <li key={warning}>{formatCoverageWarning(warning, detail.summary.sourceType)}</li>)}
+          </ul>
+        </section>
+      ) : null}
       <RepositoryRiskTrend runs={detail.scanHistory} />
       <section className="rounded-lg border border-hairline bg-surface-1"><div className="flex items-start justify-between gap-3 border-b border-hairline px-4 py-3"><div><h3 className="text-sm font-semibold text-ink">Remediation opportunities</h3><p className="mt-1 text-xs text-ink-subtle">Review findings grouped by package and target version.</p></div>{opportunities.length ? <Badge variant="outline">{opportunityCount}</Badge> : null}</div>{opportunities.length ? <div className="divide-y divide-hairline">{opportunities.map((item) => <RemediationRow key={item.key} item={item} onOpen={() => onOpenReview(item.packageName, item.fingerprints[0], { packageName: item.packageName, packageUrl: item.packageUrl, packageType: item.packageType, installedVersion: item.installedVersion, fixVersion: item.fixVersion, preferredFingerprint: item.fingerprints[0] })} />)}</div> : <p className="px-4 py-5 text-sm text-ink-subtle">No supported package fix target is recorded for current findings.</p>}</section>
-      <section className="rounded-lg border border-hairline bg-surface-1"><div className="flex items-start justify-between gap-3 border-b border-hairline px-4 py-3"><div><h3 className="text-sm font-semibold text-ink">Recent repository findings</h3><p className="mt-1 text-xs text-ink-subtle">Open findings from the last successful scan.</p></div><Button size="sm" variant="ghost" onClick={() => onOpenReview()}>Open {openFindingCount} in Review <AppIcon className="size-4" icon={ArrowRight} /></Button></div>{preview.length ? <div className="divide-y divide-hairline">{preview.map((finding) => <FindingPreview key={finding.fingerprint} finding={finding} onOpen={() => onOpenReview(finding.packageName, finding.fingerprint)} />)}</div> : <p className="px-4 py-5 text-sm text-ink-subtle">No open findings in the latest successful scan.</p>}</section>
+      <section className="rounded-lg border border-hairline bg-surface-1"><div className="flex items-start justify-between gap-3 border-b border-hairline px-4 py-3"><div><h3 className="text-sm font-semibold text-ink">Recent repository findings</h3><p className="mt-1 text-xs text-ink-subtle">Open findings from the last successful scan.</p></div><Button size="sm" variant="ghost" onClick={() => onOpenReview()}>Open {openFindingCount} in Review <AppIcon className="size-4" icon={ArrowRight} /></Button></div>{preview.length ? <div className="divide-y divide-hairline">{preview.map((finding) => <FindingPreview key={finding.fingerprint} finding={finding} onOpen={() => onOpenReview(finding.packageName, finding.fingerprint)} />)}</div> : <p className="px-4 py-5 text-sm text-ink-subtle">No open findings in the scanned inventory.</p>}</section>
     </div>
   );
 }
@@ -489,16 +504,28 @@ function RemediationRow({ item, onOpen }: { item: RemediationOpportunity; onOpen
 }
 
 function FindingPreview({ finding, onOpen }: { finding: RepoFinding; onOpen: () => void }) {
-  return <Button className="h-auto w-full justify-start rounded-none px-4 py-3 text-left whitespace-normal hover:bg-row-hover-surface focus-visible:ring-inset" onClick={onOpen} type="button" variant="ghost"><Badge variant={severityVariant(finding.severity)}>{finding.severity}</Badge><span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold text-ink">{finding.advisoryId}</span><span className="mt-1 block truncate text-xs text-ink-subtle">{finding.title ?? finding.packageName}</span></span><span className="hidden shrink-0 text-xs text-ink-subtle sm:block">{finding.packageName}</span><AppIcon className="size-4 shrink-0 text-ink-subtle" icon={ArrowRight} /></Button>;
+  const tool = finding.matchEvidence?.bundledTool;
+  return (
+    <Button className="h-auto w-full justify-start rounded-none px-4 py-3 text-left whitespace-normal hover:bg-row-hover-surface focus-visible:ring-inset" onClick={onOpen} type="button" variant="ghost">
+      <Badge variant={severityVariant(finding.severity)}>{finding.severity}</Badge>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-sm font-semibold text-ink">{finding.advisoryId}</span>
+        <span className="mt-1 block truncate text-xs text-ink-subtle">{finding.title ?? finding.packageName}</span>
+        {tool ? <span className="mt-1 block text-xs text-ink-subtle [overflow-wrap:anywhere]">{bundledToolLabel(tool)}</span> : null}
+      </span>
+      <span className="hidden shrink-0 text-xs text-ink-subtle sm:block">{finding.packageName}</span>
+      <AppIcon className="size-4 shrink-0 text-ink-subtle" icon={ArrowRight} />
+    </Button>
+  );
 }
 
 function RepositoryRiskTrend({ runs }: { runs: RepoScanRun[] }) {
   const points = runs.filter((run) => run.status === "completed").slice(0, 7).reverse();
-  if (points.length < 2 || points.every((run) => run.openCritical === undefined && run.openHigh === undefined && run.openMedium === undefined)) {
+  if (points.length < 2 || points.every((run) => run.openCritical === undefined && run.openHigh === undefined && run.openMedium === undefined && run.openOther === undefined)) {
     return <section className="rounded-lg border border-hairline bg-surface-1 px-4 py-3"><h3 className="text-sm font-semibold text-ink">Risk trend</h3><p className="mt-1 text-xs text-ink-subtle">A trend becomes available after two successful scans with comparable finding evidence.</p></section>;
   }
-  const max = Math.max(1, ...points.map((run) => (run.openCritical ?? 0) + (run.openHigh ?? 0) + (run.openMedium ?? 0)));
-  return <section className="rounded-lg border border-hairline bg-surface-1"><div className="border-b border-hairline px-4 py-3"><h3 className="text-sm font-semibold text-ink">Risk trend</h3><p className="mt-1 text-xs text-ink-subtle">Open findings across the latest comparable successful scans.</p></div><ol aria-label="Repository risk trend" className="flex h-28 items-end gap-2 px-4 pb-3 pt-4">{points.map((run) => { const critical = run.openCritical ?? 0; const high = run.openHigh ?? 0; const medium = run.openMedium ?? 0; const total = critical + high + medium; return <li aria-label={`${formatTimestamp(run.finishedAt ?? run.startedAt)}: ${critical} critical, ${high} high, ${medium} medium open findings`} className="group flex min-w-0 flex-1 flex-col items-center justify-end gap-1" key={run.id}><span className="text-xs tabular-nums text-ink-tertiary opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">{total}</span><span className="flex min-h-2 w-full max-w-14 flex-col-reverse overflow-hidden rounded-sm bg-surface-3" style={{ height: `${Math.max(8, Math.round((total / max) * 70))}px` }}><span className="bg-[color:var(--severity-medium)]" style={{ height: `${total ? (medium / total) * 100 : 0}%` }} /><span className="bg-[color:var(--severity-high)]" style={{ height: `${total ? (high / total) * 100 : 0}%` }} /><span className="bg-[color:var(--severity-critical)]" style={{ height: `${total ? (critical / total) * 100 : 0}%` }} /></span><time className="truncate text-xs text-ink-tertiary">{new Date(run.finishedAt ?? run.startedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</time></li>; })}</ol></section>;
+  const max = Math.max(1, ...points.map((run) => (run.openCritical ?? 0) + (run.openHigh ?? 0) + (run.openMedium ?? 0) + (run.openOther ?? 0)));
+  return <section className="rounded-lg border border-hairline bg-surface-1"><div className="border-b border-hairline px-4 py-3"><h3 className="text-sm font-semibold text-ink">Risk trend</h3><p className="mt-1 text-xs text-ink-subtle">Open findings across the latest comparable successful scans.</p></div><ol aria-label="Repository risk trend" className="flex h-28 items-end gap-2 px-4 pb-3 pt-4">{points.map((run) => { const critical = run.openCritical ?? 0; const high = run.openHigh ?? 0; const medium = run.openMedium ?? 0; const other = run.openOther ?? 0; const total = critical + high + medium + other; return <li aria-label={`${formatTimestamp(run.finishedAt ?? run.startedAt)}: ${critical} critical, ${high} high, ${medium} medium and ${other} other open findings`} className="group flex min-w-0 flex-1 flex-col items-center justify-end gap-1" key={run.id}><span className="text-xs tabular-nums text-ink-tertiary opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">{total}</span><span className="flex min-h-2 w-full max-w-14 flex-col-reverse overflow-hidden rounded-sm bg-surface-3" style={{ height: `${Math.max(8, Math.round((total / max) * 70))}px` }}><span className="bg-ink-subtle" style={{ height: `${total ? (other / total) * 100 : 0}%` }} /><span className="bg-[color:var(--severity-medium)]" style={{ height: `${total ? (medium / total) * 100 : 0}%` }} /><span className="bg-[color:var(--severity-high)]" style={{ height: `${total ? (high / total) * 100 : 0}%` }} /><span className="bg-[color:var(--severity-critical)]" style={{ height: `${total ? (critical / total) * 100 : 0}%` }} /></span><time className="truncate text-xs text-ink-tertiary">{new Date(run.finishedAt ?? run.startedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</time></li>; })}</ol></section>;
 }
 
 function RepositorySource({ detail }: { detail: RepoOverview }) {
@@ -535,10 +562,10 @@ function SourceField({ label, value }: { label: string; value: string }) {
 }
 
 function EvidenceMetric({ label, value, detail }: { label: string; value: string; detail?: string }) { return <div className="rounded-lg border border-hairline bg-surface-1 px-3 py-3"><p className="text-xs text-ink-subtle">{label}</p><p className="mt-1 truncate text-base font-semibold text-ink" title={value}>{value}</p>{detail ? <p className="mt-1 truncate text-xs text-ink-subtle">{detail}</p> : null}</div>; }
-function MonitoringBadge({ state }: { state: RepositoryMonitoringState }) { const variants: Record<RepositoryMonitoringState, "outline" | "secondary" | "warning" | "destructive" | "success"> = { scanning: "secondary", failed: "destructive", never_scanned: "warning", source_ahead: "warning", stale: "warning", current: "success", unknown: "outline" }; const labels: Record<RepositoryMonitoringState, string> = { scanning: "Scanning", failed: "Failed", never_scanned: "Never scanned", source_ahead: "Source ahead", stale: "Stale", current: "Current", unknown: "Unknown" }; return <Badge variant={variants[state]}>{labels[state]}</Badge>; }
+function MonitoringBadge({ state }: { state: RepositoryMonitoringState }) { const variants: Record<RepositoryMonitoringState, "outline" | "secondary" | "warning" | "destructive" | "success"> = { scanning: "secondary", failed: "destructive", never_scanned: "warning", source_ahead: "warning", stale: "warning", coverage_incomplete: "warning", current: "success", unknown: "outline" }; const labels: Record<RepositoryMonitoringState, string> = { scanning: "Scanning", failed: "Failed", never_scanned: "Never scanned", source_ahead: "Source ahead", stale: "Stale", coverage_incomplete: "Coverage incomplete", current: "Current", unknown: "Unknown" }; return <Badge variant={variants[state]}>{labels[state]}</Badge>; }
 function repoSourceLabel(repo: RepoSummary) { if (repo.sourceType === "github") return `GitHub${repo.defaultBranch ? ` · ${repo.defaultBranch}` : ""}${shortSha(repo.lastRemoteCommitSha) ? ` · ${shortSha(repo.lastRemoteCommitSha)}` : ""}`; return repo.remoteHost ? `Local · ${repo.remoteHost}` : "Local repository"; }
-function totalNew(repo: RepoSummary) { return repo.newCritical + repo.newHigh + repo.newMedium; }
-function totalResolved(repo: RepoSummary) { return repo.resolvedCritical + repo.resolvedHigh + repo.resolvedMedium; }
-function compareRepositories(left: RepoSummary, right: RepoSummary, sort: InventorySort, schedule: ScheduleInterval) { if (sort === "name") return left.name.localeCompare(right.name) || left.id - right.id; if (sort === "changes") return totalNew(right) - totalNew(left) || totalResolved(right) - totalResolved(left) || left.name.localeCompare(right.name); if (sort === "freshness") return (left.lastScannedAt ?? "").localeCompare(right.lastScannedAt ?? "") || left.name.localeCompare(right.name); const rank: Record<RepositoryMonitoringState, number> = { failed: 7, scanning: 6, never_scanned: 5, source_ahead: 4, stale: 3, unknown: 2, current: 1 }; const leftState = deriveRepositoryMonitoring(left, null, schedule).state; const rightState = deriveRepositoryMonitoring(right, null, schedule).state; return rank[rightState] - rank[leftState] || right.newCritical - left.newCritical || right.newHigh - left.newHigh || left.name.localeCompare(right.name) || left.id - right.id; }
+function totalNew(repo: RepoSummary) { return repo.newCritical + repo.newHigh + repo.newMedium + (repo.newOther ?? 0); }
+function totalResolved(repo: RepoSummary) { return repo.resolvedCritical + repo.resolvedHigh + repo.resolvedMedium + (repo.resolvedOther ?? 0); }
+function compareRepositories(left: RepoSummary, right: RepoSummary, sort: InventorySort, schedule: ScheduleInterval) { if (sort === "name") return left.name.localeCompare(right.name) || left.id - right.id; if (sort === "changes") return totalNew(right) - totalNew(left) || totalResolved(right) - totalResolved(left) || left.name.localeCompare(right.name); if (sort === "freshness") return (left.lastScannedAt ?? "").localeCompare(right.lastScannedAt ?? "") || left.name.localeCompare(right.name); const rank: Record<RepositoryMonitoringState, number> = { failed: 7, scanning: 6, never_scanned: 5, source_ahead: 4, stale: 3, coverage_incomplete: 3, unknown: 2, current: 1 }; const leftState = deriveRepositoryMonitoring(left, null, schedule).state; const rightState = deriveRepositoryMonitoring(right, null, schedule).state; return rank[rightState] - rank[leftState] || right.newCritical - left.newCritical || right.newHigh - left.newHigh || left.name.localeCompare(right.name) || left.id - right.id; }
 function severityVariant(severity: Severity): "destructive" | "warning" | "secondary" { return severity === "CRITICAL" ? "destructive" : severity === "HIGH" ? "warning" : "secondary"; }
 function shortSha(value: string | null | undefined) { return value ? value.slice(0, 8) : null; }

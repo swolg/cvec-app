@@ -171,7 +171,12 @@ impl GithubApiClient {
             .github_request(self.client.get(url), "application/vnd.github.raw+json")
             .send()
             .await
-            .map_err(|cause| Error::App(format!("failed to fetch GitHub file {path}: {cause}")))?;
+            .map_err(|cause| {
+                Error::App(format!(
+                    "failed to fetch GitHub file {path}: {}",
+                    cause.without_url()
+                ))
+            })?;
         let response = self.map_status(response).await?;
 
         if let Some(content_length) = response.content_length() {
@@ -181,11 +186,12 @@ impl GithubApiClient {
         let mut bytes =
             Vec::with_capacity(response.content_length().unwrap_or(0).min(1024 * 1024) as usize);
         let mut response = response;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|cause| Error::App(format!("failed to read GitHub file {path}: {cause}")))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|cause| {
+            Error::App(format!(
+                "failed to read GitHub file {path}: {}",
+                cause.without_url()
+            ))
+        })? {
             let next_size = (bytes.len() as u64).saturating_add(chunk.len() as u64);
             check_size(next_size)?;
             bytes.extend_from_slice(&chunk);
@@ -352,6 +358,7 @@ fn is_allowed_github_redirect(url: &reqwest::Url) -> bool {
             Some(
                 "api.github.com"
                     | "github.com"
+                    | "codeload.github.com"
                     | "raw.githubusercontent.com"
                     | "objects.githubusercontent.com"
             )

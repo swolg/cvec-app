@@ -146,10 +146,12 @@ mod platform {
             Ok(Self(open_directory(&entry.parent, &entry.name, create)?))
         }
 
-        pub(super) fn entry_names(&self) -> io::Result<impl Iterator<Item = OsString>> {
-            Ok(fs::Dir::read_from(&self.0)?
-                .map_while(Result::ok)
-                .map(|entry| OsString::from_vec(entry.file_name().to_bytes().to_vec())))
+        pub(super) fn entry_names(&self) -> io::Result<impl Iterator<Item = io::Result<OsString>>> {
+            Ok(fs::Dir::read_from(&self.0)?.map(|entry| {
+                entry
+                    .map(|entry| OsString::from_vec(entry.file_name().to_bytes().to_vec()))
+                    .map_err(io::Error::from)
+            }))
         }
     }
 
@@ -188,6 +190,16 @@ mod platform {
         }
 
         pub(super) fn open(&self) -> io::Result<File> {
+            let file = self.open_regular()?;
+            if file.metadata()?.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Workspace source must be a regular file with a single link",
+                ));
+            }
+            Ok(file)
+        }
+        pub(super) fn open_regular(&self) -> io::Result<File> {
             let file: File = fs::openat(
                 &self.parent,
                 &self.name,
@@ -196,10 +208,10 @@ mod platform {
             )?
             .into();
             let metadata = file.metadata()?;
-            if !metadata.is_file() || metadata.nlink() != 1 {
+            if !metadata.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "Workspace source must be a regular file with a single link",
+                    "Source must be a regular file",
                 ));
             }
             Ok(file)
@@ -339,7 +351,9 @@ impl AnchoredRoot {
     }
 
     #[cfg(unix)]
-    pub(super) fn entry_names(&self) -> io::Result<impl Iterator<Item = std::ffi::OsString>> {
+    pub(super) fn entry_names(
+        &self,
+    ) -> io::Result<impl Iterator<Item = io::Result<std::ffi::OsString>>> {
         self.0.entry_names()
     }
 }
@@ -349,6 +363,10 @@ impl AnchoredEntry {
     }
     pub(super) fn open(&self) -> io::Result<File> {
         self.0.open()
+    }
+    #[cfg(unix)]
+    pub(super) fn open_regular(&self) -> io::Result<File> {
+        self.0.open_regular()
     }
     pub(super) fn symlink_target(&self) -> io::Result<Option<Vec<u8>>> {
         self.0.symlink_target()

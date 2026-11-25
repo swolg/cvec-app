@@ -2,6 +2,9 @@ import {performanceCountersEnabled,recordPerformanceSample} from "./performanceC
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSnapshot,
+  ArtifactFindings,
+  ArtifactScan,
+  ArtifactScanKind,
   ExternalIntelDetail,
   ExternalIntelFeed,
   GithubLoginPollResult,
@@ -26,6 +29,7 @@ import type {
   FindingRemediationProjection,
 } from "./types";
 import { parseDependencyPage, parseReviewFinding, parseFindingRemediation, parseLocalEntityResults, parseRepoAssets, parseRepoOverview, parseRepoScanComparison, parseReviewPage } from "./contracts";
+import { parseArtifactFindings, parseArtifactScan } from "./contracts";
 
 export async function bootstrap(): Promise<AppSnapshot> {
   return invoke<AppSnapshot>("bootstrap");
@@ -75,6 +79,21 @@ export async function getRepoOverview(repoId: number): Promise<RepoOverview> {
 
 export async function listRepositoryAssets(repoId: number): Promise<RepoAsset[]> {
   return parseRepoAssets(await invoke<unknown>("list_repository_assets", { repoId }), repoId);
+}
+
+export async function listArtifactScans(repoId: number): Promise<ArtifactScan[]> {
+  const scans = await invoke<unknown>("list_artifact_scans", { repoId });
+  if (!Array.isArray(scans)) throw new Error("Malformed artifact scan history payload");
+  return scans.map((scan) => parseArtifactScan(scan, repoId));
+}
+
+export async function scanArtifact(repoId: number, kind: ArtifactScanKind): Promise<ArtifactScan | null> {
+  const scan = await invoke<unknown>("scan_artifact", { repoId, kind });
+  return scan === null ? null : parseArtifactScan(scan, repoId);
+}
+
+export async function getArtifactFindings(repoId: number, scanId: number, offset: number): Promise<ArtifactFindings> {
+  return parseArtifactFindings(await invoke<unknown>("get_artifact_findings", { repoId, scanId, offset }), repoId, scanId, offset);
 }
 
 export async function listRepositoryDependencies(repoId: number, query: DependencyQuery): Promise<DependencyPage> {

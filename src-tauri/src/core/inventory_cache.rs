@@ -38,7 +38,7 @@ pub(crate) fn fingerprint(root: &Path, tool: &Path, config: &[u8]) -> Result<Str
     let mut bytes = 0u64;
     let root = root.canonicalize()?;
     let tool = tool.canonicalize()?;
-    hash.update(b"cvec-inventory-v2-cdx-syft-json");
+    hash.update(b"cvec-inventory-v3-javascript-dev-go-symbols");
     hash.update(root.as_os_str().as_encoded_bytes());
     hash.update(config);
     let mut environment = std::env::vars_os().collect::<Vec<_>>();

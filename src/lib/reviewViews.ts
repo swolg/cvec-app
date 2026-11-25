@@ -1,6 +1,6 @@
 import { z } from "zod/mini";
 
-import type { ReviewFilters, ReviewQuery, ReviewSort } from "./types";
+import { SEVERITIES, type ReviewFilters, type ReviewQuery, type ReviewSort } from "./types";
 
 export const REVIEW_VIEWS_STORAGE_KEY = "cvec.review.views.v2";
 export const REVIEW_VIEWS_LEGACY_KEY = "cvec.review.views.v1";
@@ -56,7 +56,7 @@ export type ReviewPresentation = z.infer<typeof reviewPresentationSchema>;
 const filtersSchema = z.object({
   reviewStates: z.array(z.enum(["unreviewed", "reviewed", "snoozed"])).check(z.maxLength(3)),
   scannerStates: z.array(z.enum(["new", "open", "resolved"])).check(z.maxLength(3)),
-  severities: z.array(z.enum(["MEDIUM", "HIGH", "CRITICAL"])).check(z.maxLength(3)),
+  severities: z.array(z.enum(SEVERITIES)).check(z.maxLength(SEVERITIES.length)),
   repoIds: z.array(z.int().check(z.positive())).check(z.maxLength(200)),
   sourceTypes: z.array(z.enum(["local", "github", "unknown"])).check(z.maxLength(3)),
   fixAvailable: z.nullable(z.boolean()), packages: z.array(z.string().check(z.trim(), z.minLength(1), z.maxLength(200))).check(z.maxLength(200)),
@@ -101,7 +101,7 @@ export const BUILT_IN_REVIEW_VIEWS: readonly ReviewViewDefinition[] = [
 
 export const DASHBOARD_REVIEW_VIEWS: readonly ReviewViewDefinition[] = [
   { id: CRITICAL_TO_REVIEW_VIEW, name: "Critical to review", query: reviewQuery({ scannerStates: ["new", "open"], reviewStates: ["unreviewed"], severities: ["CRITICAL"] }), presentation: DEFAULT_TABLE_PRESENTATION, builtIn: true },
-  { id: OTHER_TO_REVIEW_VIEW, name: "Other findings to review", query: reviewQuery({ scannerStates: ["new", "open"], reviewStates: ["unreviewed"], severities: ["HIGH", "MEDIUM"] }), presentation: DEFAULT_TABLE_PRESENTATION, builtIn: true },
+  { id: OTHER_TO_REVIEW_VIEW, name: "Other findings to review", query: reviewQuery({ scannerStates: ["new", "open"], reviewStates: ["unreviewed"], severities: SEVERITIES.filter((severity) => severity !== "CRITICAL") }), presentation: DEFAULT_TABLE_PRESENTATION, builtIn: true },
 ];
 
 export function defaultReviewViewsState(): ReviewViewsState { return { version: 2, customViews: [], favoriteIds: [], defaultViewId: "needs-review" }; }

@@ -1,10 +1,12 @@
 use crate::core::timestamps;
+mod artifact_scans;
 mod chat_cache;
 mod chat_drafts;
 mod enrichment;
 mod fix_workspaces;
 mod intel_packages;
 mod inventory;
+mod match_evidence;
 mod review;
 mod revisions;
 
@@ -2443,15 +2445,19 @@ impl Database {
                    COALESCE(rv.revision, 0) AS evidence_revision,
                    COALESCE(rv.dependency_revision, 0) AS dependency_revision, latest.status AS last_scan_status,
                    completed.id AS completed_run_id, completed.finished_at, completed.source_revision,
+                   COALESCE(json_array_length(completed.coverage_warnings_json)>0,0) AS coverage_incomplete,
                    COALESCE(completed.new_medium_count, 0) AS new_medium,
                    COALESCE(completed.new_high_count, 0) AS new_high,
                    COALESCE(completed.new_critical_count, 0) AS new_critical,
+                   COALESCE(completed.new_other_count, 0) AS new_other,
                    COALESCE(completed.resolved_medium_count, 0) AS resolved_medium,
                    COALESCE(completed.resolved_high_count, 0) AS resolved_high,
                    COALESCE(completed.resolved_critical_count, 0) AS resolved_critical,
+                   COALESCE(completed.resolved_other_count, 0) AS resolved_other,
                    (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = completed.id AND severity = 'MEDIUM') AS open_medium,
                    (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = completed.id AND severity = 'HIGH') AS open_high,
-                   (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = completed.id AND severity = 'CRITICAL') AS open_critical
+                   (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = completed.id AND severity = 'CRITICAL') AS open_critical,
+                   (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = completed.id AND severity NOT IN ('CRITICAL','HIGH','MEDIUM')) AS open_other
             FROM repos r
             LEFT JOIN repository_data_revisions rv ON rv.repo_id = r.id
             LEFT JOIN scan_runs latest ON latest.id = (
@@ -2462,8 +2468,8 @@ impl Database {
                 ORDER BY finished_at DESC, id DESC LIMIT 1
             )
             WHERE r.is_active = 1 {scope}
-            ORDER BY open_critical DESC, open_high DESC, open_medium DESC,
-                     new_critical DESC, new_high DESC, new_medium DESC, completed.finished_at DESC, r.name, r.id
+            ORDER BY open_critical DESC, open_high DESC, open_medium DESC, open_other DESC,
+                     new_critical DESC, new_high DESC, new_medium DESC, new_other DESC, completed.finished_at DESC, r.name, r.id
             "#,
         ))?;
         let rows = statement.query_map(rusqlite::params_from_iter(repo_id), |row| {
@@ -2474,11 +2480,14 @@ impl Database {
             let open_medium: u32 = row.get("open_medium")?;
             let open_high: u32 = row.get("open_high")?;
             let open_critical: u32 = row.get("open_critical")?;
+            let open_other: u32 = row.get("open_other")?;
             let status = match last_scan_status {
                 Some(ScanRunStatus::Running) => RepoStatus::Scanning,
                 Some(ScanRunStatus::Failed) => RepoStatus::Error,
                 _ if new_critical > 0 => RepoStatus::Critical,
-                _ if open_medium > 0 || open_high > 0 || open_critical > 0 => RepoStatus::Warning,
+                _ if open_medium + open_high + open_critical + open_other > 0 => {
+                    RepoStatus::Warning
+                }
                 _ if completed.is_some() => RepoStatus::Clean,
                 _ => RepoStatus::Unknown,
             };
@@ -2499,15 +2508,19 @@ impl Database {
                 evidence_revision: row.get::<_, i64>("evidence_revision")?.max(0) as u64,
                 dependency_revision: row.get::<_, i64>("dependency_revision")?.max(0) as u64,
                 status,
+                coverage_incomplete: row.get("coverage_incomplete")?,
                 new_medium: row.get("new_medium")?,
                 new_high: row.get("new_high")?,
                 new_critical,
+                new_other: row.get("new_other")?,
                 open_medium,
                 open_high,
                 open_critical,
+                open_other,
                 resolved_medium: row.get("resolved_medium")?,
                 resolved_high: row.get("resolved_high")?,
                 resolved_critical: row.get("resolved_critical")?,
+                resolved_other: row.get("resolved_other")?,
                 last_scanned_at: if completed.is_some() {
                     Some(row.get("finished_at")?)
                 } else {
@@ -3336,10 +3349,11 @@ impl Database {
                 SELECT run_id,
                     (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = run_id AND severity = 'MEDIUM') AS medium,
                     (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = run_id AND severity = 'HIGH') AS high,
-                    (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = run_id AND severity = 'CRITICAL') AS critical
+                    (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = run_id AND severity = 'CRITICAL') AS critical,
+                    (SELECT COUNT(*) FROM vulnerabilities WHERE scan_run_id = run_id AND severity NOT IN ('CRITICAL','HIGH','MEDIUM')) AS other
                 FROM (SELECT DISTINCT run_id FROM selected WHERE run_id IS NOT NULL)
             )
-            SELECT dates.day, COALESCE(SUM(medium), 0), COALESCE(SUM(high), 0), COALESCE(SUM(critical), 0)
+            SELECT dates.day, COALESCE(SUM(medium), 0), COALESCE(SUM(high), 0), COALESCE(SUM(critical), 0), COALESCE(SUM(other), 0)
             FROM dates LEFT JOIN selected USING (day) LEFT JOIN counts USING (run_id)
             GROUP BY dates.day ORDER BY dates.day
             "#,
@@ -3351,6 +3365,7 @@ impl Database {
                     medium: row.get(1)?,
                     high: row.get(2)?,
                     critical: row.get(3)?,
+                    other: row.get(4)?,
                 })
             })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -4090,7 +4105,7 @@ impl Database {
         let transaction =
             Self::begin_scan_completion(&mut connection, input.repo_id, input.run_id)?;
         let previous = Self::previous_completed_scan(&transaction, input.repo_id, input.run_id)?;
-        Self::persist_scan(&transaction, input, &now(), previous, None)?;
+        Self::persist_scan(&transaction, input, &now(), previous, None, &[])?;
         transaction.commit()?;
         Ok(())
     }
@@ -4139,6 +4154,10 @@ impl Database {
             .as_ref()
             .map(|evidence| serde_json::to_string(&evidence.scope))
             .transpose()?;
+        let coverage_warnings = output
+            .evidence
+            .as_ref()
+            .map_or(&[][..], |evidence| evidence.coverage_warnings.as_slice());
         let resolved_findings = Self::persist_scan(
             &transaction,
             ScanCompletion {
@@ -4153,15 +4172,48 @@ impl Database {
             &finished_at,
             previous,
             scope.as_deref(),
+            coverage_warnings,
         )?;
+        if let Some(evidence) = output
+            .evidence
+            .as_ref()
+            .filter(|evidence| !evidence.nuget_projects.is_empty())
+        {
+            transaction.execute(
+                "UPDATE scan_runs SET nuget_projects_json = ?1 WHERE id = ?2 AND repo_id = ?3",
+                params![
+                    serde_json::to_string(&evidence.nuget_projects)?,
+                    run_id,
+                    repo_id
+                ],
+            )?;
+        }
         let (reopened, review_warning) =
             Self::record_scan_review_result(&mut transaction, repo_id, run_id, &changes)?;
+        let changed: HashSet<_> = changes
+            .new
+            .iter()
+            .chain(&changes.worsened)
+            .copied()
+            .collect();
+        let alerts = output
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.severity >= Severity::High
+                    && changed.contains(finding.fingerprint.as_str())
+                    && finding
+                        .match_evidence
+                        .as_ref()
+                        .is_none_or(|evidence| !evidence.requires_review())
+            })
+            .count() as u32;
         transaction.commit()?;
         Ok(ScanReviewChanges {
             new_findings: changes.new.len() as u32,
             worsened_findings: changes.worsened.len() as u32 + reopened,
             resolved_findings,
-            alerts: changes.delta.new_high_count + changes.delta.new_critical_count,
+            alerts,
             review_warning,
         })
     }
@@ -4254,6 +4306,7 @@ impl Database {
         finished_at: &str,
         previous: Option<i64>,
         scope: Option<&str>,
+        coverage_warnings: &[String],
     ) -> Result<u32, Error> {
         let ScanCompletion {
             repo_id,
@@ -4269,8 +4322,8 @@ impl Database {
                 r#"
 	                INSERT INTO vulnerabilities
 	                (repo_id, scan_run_id, fingerprint, advisory_id, package_name, package_version, package_type,
-	                 package_url, severity, fix_version, title, source_url, advisory_details_json)
-	                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+	                 package_url, severity, fix_version, title, source_url, advisory_details_json, match_evidence_json)
+	                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 "#,
             )?.execute(params![
                     repo_id,
@@ -4289,7 +4342,8 @@ impl Database {
 	                        .advisory_details
 	                        .as_ref()
 	                        .map(serde_json::to_string)
-	                        .transpose()?
+	                        .transpose()?,
+                    finding.match_evidence.as_ref().map(serde_json::to_string).transpose()?
 	                ],
 	            )?;
         }
@@ -4370,7 +4424,7 @@ impl Database {
                 ])?;
         }
 
-        let (resolved_medium, resolved_high, resolved_critical) =
+        let (resolved_medium, resolved_high, resolved_critical, resolved_other) =
             Self::scan_resolution_counts(transaction, previous, run_id)?;
         transaction.execute(
             r#"
@@ -4387,6 +4441,9 @@ impl Database {
                 source_dirty = ?10,
                 package_count = ?11,
                 scan_scope = ?12,
+                new_other_count = ?13,
+                resolved_other_count = ?14,
+                coverage_warnings_json = ?15,
                 warnings_json = '[]',
                 evidence_complete = 1
             WHERE id = ?1
@@ -4404,6 +4461,9 @@ impl Database {
                 source_snapshot.dirty,
                 packages.len() as i64,
                 scope,
+                delta.new_other_count,
+                resolved_other,
+                serde_json::to_string(coverage_warnings)?,
             ],
         )?;
 
@@ -4445,7 +4505,7 @@ impl Database {
             [repo_id],
         )?;
 
-        Ok(resolved_medium + resolved_high + resolved_critical)
+        Ok(resolved_medium + resolved_high + resolved_critical + resolved_other)
     }
 
     pub fn record_scan_warnings(&self, run_id: i64, warnings: &[String]) -> Result<(), Error> {
@@ -4519,7 +4579,7 @@ impl Database {
 
         let mut statement = connection.prepare(
             r#"
-            SELECT fingerprint, advisory_id, package_name, package_version, package_type, package_url, severity, fix_version, title, source_url, advisory_details_json
+            SELECT fingerprint, advisory_id, package_name, package_version, package_type, package_url, severity, fix_version, title, source_url, advisory_details_json, match_evidence_json
             FROM vulnerabilities
             WHERE repo_id = ?1 AND scan_run_id = ?2
             ORDER BY advisory_id, package_name
@@ -4534,13 +4594,16 @@ impl Database {
                 package_name: row.get(2)?,
                 package_version: row.get(3)?,
                 package_type: row.get(4)?,
-                severity: Severity::parse(&severity).unwrap_or(Severity::High),
+                severity: Severity::parse(&severity).unwrap_or(Severity::Unknown),
                 fix_version: row.get(7)?,
                 title: row.get(8)?,
                 source_url: row.get(9)?,
                 package_url: row.get(5)?,
                 advisory_details: row
                     .get::<_, Option<String>>(10)?
+                    .and_then(|value| serde_json::from_str(&value).ok()),
+                match_evidence: row
+                    .get::<_, Option<String>>(11)?
                     .and_then(|value| serde_json::from_str(&value).ok()),
             })
         })?;
@@ -4578,7 +4641,7 @@ impl Database {
             let severity: String = row.get(1)?;
             Ok((
                 row.get(0)?,
-                Severity::parse(&severity).unwrap_or(Severity::High),
+                Severity::parse(&severity).unwrap_or(Severity::Unknown),
             ))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -4588,20 +4651,21 @@ impl Database {
         connection: &Connection,
         previous: Option<i64>,
         current: i64,
-    ) -> Result<(u32, u32, u32), Error> {
+    ) -> Result<(u32, u32, u32, u32), Error> {
         let Some(previous) = previous else {
-            return Ok((0, 0, 0));
+            return Ok((0, 0, 0, 0));
         };
         let detected = scan_has_finding("current", "?2", "v");
         Ok(connection.query_row(
             &format!(
                 "SELECT COUNT(*) FILTER (WHERE severity='MEDIUM' COLLATE NOCASE),
-                        COUNT(*) FILTER (WHERE severity COLLATE NOCASE NOT IN ('MEDIUM','CRITICAL')),
-                        COUNT(*) FILTER (WHERE severity='CRITICAL' COLLATE NOCASE)
+                        COUNT(*) FILTER (WHERE severity='HIGH' COLLATE NOCASE),
+                        COUNT(*) FILTER (WHERE severity='CRITICAL' COLLATE NOCASE),
+                        COUNT(*) FILTER (WHERE severity COLLATE NOCASE NOT IN ('MEDIUM','HIGH','CRITICAL'))
                  FROM vulnerabilities v WHERE v.scan_run_id=?1 AND NOT {detected}"
             ),
             params![previous, current],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?)
     }
 
@@ -4748,6 +4812,21 @@ impl Database {
               scope TEXT NOT NULL CHECK(length(scope) BETWEEN 1 AND 1024),
               text TEXT NOT NULL CHECK(length(text) <= 65536),
               PRIMARY KEY(repository_id, scope)
+            );
+
+            CREATE TABLE IF NOT EXISTS artifact_scans (
+              id INTEGER PRIMARY KEY,
+              repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+              summary TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS artifact_scans_repository ON artifact_scans(repo_id, id);
+
+            CREATE TABLE IF NOT EXISTS artifact_scan_findings (
+              scan_id INTEGER NOT NULL REFERENCES artifact_scans(id) ON DELETE CASCADE,
+              position INTEGER NOT NULL,
+              finding TEXT NOT NULL,
+              PRIMARY KEY(scan_id, position)
             );
 
             CREATE TABLE IF NOT EXISTS companion_threads (
@@ -5094,6 +5173,7 @@ impl Database {
         self.recover_interrupted_scans(&mut connection)?;
         self.init_data_revisions(&connection)?;
         Self::reconcile_scan_resolution_counts(&mut connection)?;
+        Self::reconcile_scan_match_evidence(&mut connection)?;
         restrict_database_file_permissions(&self.path)?;
         Ok(())
     }
@@ -5118,7 +5198,7 @@ impl Database {
             transaction.execute_batch(&format!(
                 "WITH resolved AS MATERIALIZED (
                      SELECT s.id, COUNT(*) FILTER (WHERE v.severity='MEDIUM' COLLATE NOCASE) medium,
-                                  COUNT(*) FILTER (WHERE v.severity COLLATE NOCASE NOT IN ('MEDIUM','CRITICAL')) high,
+                                  COUNT(*) FILTER (WHERE v.severity='HIGH' COLLATE NOCASE) high,
                                   COUNT(*) FILTER (WHERE v.severity='CRITICAL' COLLATE NOCASE) critical
                      FROM scan_runs s JOIN vulnerabilities v ON v.scan_run_id=(
                          SELECT p.id FROM scan_runs p WHERE p.repo_id=s.repo_id AND p.status='completed'
@@ -5538,11 +5618,15 @@ impl Database {
         for (column, definition) in [
             ("new_medium_count", "INTEGER NOT NULL DEFAULT 0"),
             ("resolved_medium_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("new_other_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("resolved_other_count", "INTEGER NOT NULL DEFAULT 0"),
             ("source_revision", "TEXT"),
             ("source_dirty", "INTEGER"),
             ("package_count", "INTEGER"),
             ("reopened_count", "INTEGER NOT NULL DEFAULT 0"),
             ("warnings_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("coverage_warnings_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("nuget_projects_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("scan_scope", "TEXT"),
             ("evidence_complete", "INTEGER NOT NULL DEFAULT 0"),
         ] {
@@ -5565,7 +5649,11 @@ impl Database {
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
 
-        for (column, definition) in [("package_url", "TEXT"), ("advisory_details_json", "TEXT")] {
+        for (column, definition) in [
+            ("package_url", "TEXT"),
+            ("advisory_details_json", "TEXT"),
+            ("match_evidence_json", "TEXT"),
+        ] {
             if columns.iter().any(|existing| existing == column) {
                 continue;
             }
@@ -5589,6 +5677,18 @@ impl Database {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(StdDuration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.create_scalar_function(
+            "cvec_severity_rank",
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                Ok(context
+                    .get_raw(0)
+                    .as_str_or_null()?
+                    .and_then(Severity::parse)
+                    .map_or(0, Severity::rank))
+            },
+        )?;
         connection.create_scalar_function(
             "cvec_package_identity",
             4,
@@ -5795,7 +5895,7 @@ impl Database {
         let mut statement = connection.prepare(
             r#"
 	            SELECT fingerprint, advisory_id, package_name, package_version, package_type, package_url,
-	                   severity, fix_version, title, source_url, advisory_details_json
+	                   severity, fix_version, title, source_url, advisory_details_json, match_evidence_json
             FROM vulnerabilities
             WHERE repo_id = ?1 AND scan_run_id = ?2
             ORDER BY advisory_id, package_name
@@ -5810,12 +5910,15 @@ impl Database {
                 package_version: row.get(3)?,
                 package_type: row.get(4)?,
                 package_url: row.get(5)?,
-                severity: Severity::parse(&severity).unwrap_or(Severity::High),
+                severity: Severity::parse(&severity).unwrap_or(Severity::Unknown),
                 fix_version: row.get(7)?,
                 title: row.get(8)?,
                 source_url: row.get(9)?,
                 advisory_details: row
                     .get::<_, Option<String>>(10)?
+                    .and_then(|value| serde_json::from_str(&value).ok()),
+                match_evidence: row
+                    .get::<_, Option<String>>(11)?
                     .and_then(|value| serde_json::from_str(&value).ok()),
             })
         })?;
@@ -5884,12 +5987,16 @@ impl Database {
             new_medium: repos.iter().map(|repo| repo.new_medium).sum(),
             new_high: repos.iter().map(|repo| repo.new_high).sum(),
             new_critical: repos.iter().map(|repo| repo.new_critical).sum(),
+            new_other: repos.iter().map(|repo| repo.new_other).sum(),
             open_medium: repos.iter().map(|repo| repo.open_medium).sum(),
             open_high: repos.iter().map(|repo| repo.open_high).sum(),
             open_critical: repos.iter().map(|repo| repo.open_critical).sum(),
+            open_other: repos.iter().map(|repo| repo.open_other).sum(),
             repos_with_new_findings: repos
                 .iter()
-                .filter(|repo| repo.new_medium > 0 || repo.new_high > 0 || repo.new_critical > 0)
+                .filter(|repo| {
+                    repo.new_medium + repo.new_high + repo.new_critical + repo.new_other > 0
+                })
                 .count() as u32,
             last_successful_scan_at: last_successful_scan_at.clone(),
         }
@@ -6037,7 +6144,7 @@ fn validate_review_query(query: &ReviewQuery) -> Result<(), Error> {
 
 fn review_group_counts(items: &[ReviewFinding]) -> ReviewGroupCounts {
     let mut review_state = [0_u32; 3];
-    let mut severity = [0_u32; 3];
+    let mut severity = [0_u32; Severity::ALL.len()];
     let mut fix_availability = [0_u32; 2];
     let mut repositories = std::collections::BTreeMap::<i64, (String, u32)>::new();
 
@@ -6047,11 +6154,7 @@ fn review_group_counts(items: &[ReviewFinding]) -> ReviewGroupCounts {
             ReviewState::Reviewed => review_state[1] += 1,
             ReviewState::Snoozed => review_state[2] += 1,
         }
-        match item.finding.severity {
-            Severity::Critical => severity[0] += 1,
-            Severity::High => severity[1] += 1,
-            Severity::Medium => severity[2] += 1,
-        }
+        severity[Severity::ALL.len() - usize::from(item.finding.severity.rank())] += 1;
         fix_availability[usize::from(item.finding.fix_version.is_none())] += 1;
         let repository = repositories
             .entry(item.repo_id)
@@ -6088,19 +6191,15 @@ fn review_group_counts(items: &[ReviewFinding]) -> ReviewGroupCounts {
             count,
         })
         .collect(),
-        severity: [
-            ("CRITICAL", "Critical"),
-            ("HIGH", "High"),
-            ("MEDIUM", "Medium"),
-        ]
-        .into_iter()
-        .zip(severity)
-        .map(|((id, label), count)| ReviewLaneCount {
-            id: id.to_string(),
-            label: label.to_string(),
-            count,
-        })
-        .collect(),
+        severity: Severity::ALL
+            .into_iter()
+            .zip(severity)
+            .map(|(severity, count)| ReviewLaneCount {
+                id: severity.as_str().to_string(),
+                label: severity.label().to_string(),
+                count,
+            })
+            .collect(),
         repository,
         fix_availability: [
             ("available", "Fix available"),
@@ -6297,7 +6396,7 @@ fn text_score(candidate: &str, needle: &str) -> Option<u8> {
 fn is_safe_stored_relative_path(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 1_024
-        && !value.as_bytes().contains(&0)
+        && !value.chars().any(char::is_control)
         && !Path::new(value).is_absolute()
         && Path::new(value)
             .components()
@@ -6506,6 +6605,7 @@ fn repo_finding_from_normalized(
         fix_version: finding.fix_version.clone(),
         title: finding.title.clone(),
         source_url: finding.source_url.clone(),
+        match_evidence: finding.match_evidence.clone(),
         state,
         intel: finding
             .advisory_details
@@ -6638,11 +6738,7 @@ fn severity_rank_opt(severity: Option<&Severity>) -> u8 {
 }
 
 fn severity_rank(severity: &Severity) -> u8 {
-    match severity {
-        Severity::Critical => 3,
-        Severity::High => 2,
-        Severity::Medium => 1,
-    }
+    severity.rank()
 }
 
 fn relevance_rank(value: &ExternalIntelRelevance) -> u8 {
@@ -6917,7 +7013,10 @@ const SCAN_RUN_DETAILS: &str = r#"
            evidence_complete,
            (SELECT COUNT(*) FROM vulnerabilities v WHERE v.scan_run_id=scan_runs.id AND v.severity='MEDIUM') AS open_medium,
            (SELECT COUNT(*) FROM vulnerabilities v WHERE v.scan_run_id=scan_runs.id AND v.severity='HIGH') AS open_high,
-           (SELECT COUNT(*) FROM vulnerabilities v WHERE v.scan_run_id=scan_runs.id AND v.severity='CRITICAL') AS open_critical
+           (SELECT COUNT(*) FROM vulnerabilities v WHERE v.scan_run_id=scan_runs.id AND v.severity='CRITICAL') AS open_critical,
+           new_other_count, resolved_other_count,
+           (SELECT COUNT(*) FROM vulnerabilities v WHERE v.scan_run_id=scan_runs.id AND v.severity NOT IN ('CRITICAL','HIGH','MEDIUM')) AS open_other,
+           coverage_warnings_json
     FROM scan_runs
 "#;
 
@@ -6943,6 +7042,10 @@ fn scan_run_from_row(row: &Row<'_>) -> rusqlite::Result<RepoScanRun> {
         open_medium: row.get(17)?,
         open_high: row.get(18)?,
         open_critical: row.get(19)?,
+        new_other: row.get(20)?,
+        resolved_other: row.get(21)?,
+        open_other: row.get(22)?,
+        coverage_warnings: serde_json::from_str(row.get_ref(23)?.as_str()?).unwrap_or_default(),
     })
 }
 
@@ -8451,6 +8554,7 @@ mod tests {
                     .then(|| "2.0".into()),
                 title: None,
                 source_url: None,
+                match_evidence: None,
                 advisory_details: None,
             })
             .collect();
@@ -9573,6 +9677,176 @@ mod tests {
     }
 
     #[test]
+    fn scan_results_keep_all_severities_and_keep_uncertain_matches_out_of_alerts() {
+        use crate::core::models::{FindingMatchEvidence, FindingMatchKind};
+
+        let temp = tempdir().unwrap();
+        let db = Database::new(temp.path().join("match-coverage.db")).unwrap();
+        seed_companion_repository(&db, 1, "coverage");
+        let versions = ScannerVersions {
+            syft: "fixture".into(),
+            grype: "fixture".into(),
+        };
+        let run = db.insert_scan_start(1, &versions).unwrap();
+        let findings = [
+            Severity::High,
+            Severity::Low,
+            Severity::Negligible,
+            Severity::Unknown,
+        ]
+        .into_iter()
+        .map(|severity| NormalizedFinding {
+            fingerprint: format!("fixture-{}", severity.as_str()),
+            advisory_id: format!("CVE-{}", severity.as_str()),
+            package_name: "example".into(),
+            package_version: Some("1.0.0".into()),
+            package_type: Some("npm".into()),
+            package_url: Some("pkg:npm/example@1.0.0".into()),
+            severity,
+            fix_version: None,
+            title: None,
+            source_url: None,
+            advisory_details: None,
+            match_evidence: Some(FindingMatchEvidence {
+                kind: if severity == Severity::High {
+                    FindingMatchKind::Cpe
+                } else {
+                    FindingMatchKind::PackageVersion
+                },
+                relative_path: Some("package-lock.json".into()),
+                bundled_tool: None,
+            }),
+        })
+        .collect();
+        let output = ScanOutput {
+            findings,
+            packages: vec![],
+            remediation_evidence: vec![],
+            evidence: None,
+        };
+        let changes = db
+            .complete_repository_scan(1, run, &output, &SourceSnapshot::default(), &[], None)
+            .unwrap();
+        assert_eq!(changes.new_findings, 4);
+        assert_eq!(changes.alerts, 0);
+        let detail = db.repo_overview(1).unwrap();
+        assert_eq!(detail.overview.open_finding_count, 4);
+        assert_eq!(detail.summary.open_other, 3);
+        assert_eq!(detail.latest_scan.unwrap().new_other, 3);
+        assert_eq!(
+            detail.findings[0].match_evidence.as_ref().unwrap().kind,
+            FindingMatchKind::Cpe
+        );
+
+        let mut query = ReviewQuery::default();
+        query.filters.severities = vec![Severity::Low, Severity::Unknown];
+        let review = db.list_review_findings(&query).unwrap();
+        assert_eq!(review.total, 2);
+        assert_eq!(review.items[0].finding.severity, Severity::Low);
+    }
+
+    #[test]
+    fn reopens_saved_findings_with_repository_fixes_only_for_proven_sources() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("saved-go-tool.db");
+        let db = Database::new(path.clone()).unwrap();
+        seed_review_finding(&db, "locked-npm", "MEDIUM", Some("2.0.0"));
+        let connection = db.connect().unwrap();
+        connection
+            .execute(
+                "UPDATE vulnerabilities SET match_evidence_json=?1 WHERE fingerprint='locked-npm'",
+                [r#"{"kind":"package_version","relativePath":"package-lock.json"}"#],
+            )
+            .unwrap();
+        connection.execute(
+            r#"INSERT INTO vulnerabilities (
+                   repo_id,scan_run_id,fingerprint,advisory_id,package_name,package_version,package_type,severity,fix_version,match_evidence_json
+               ) VALUES
+                 (1,1,'bundled-go','GO-FIXTURE','example.com/module','1.0.0','go-module','HIGH','1.0.1',?1),
+                 (1,1,'fallback-go','GO-FALLBACK','example.com/fallback','1.0.0','go-module','HIGH','1.0.1',?2),
+                 (1,1,'manifest-go','GO-MANIFEST','example.com/manifest','1.0.0','go-module','HIGH','1.0.1',?3),
+                 (1,1,'fallback-npm','GHSA-FALLBACK','old-tool','1.0.0','npm','HIGH','1.0.1',?2)"#,
+            [
+                r#"{"kind":"go_symbol","relativePath":"node_modules/@example/cli/lib/tool"}"#,
+                r#"{"kind":"package_version","relativePath":null}"#,
+                r#"{"kind":"package_version","relativePath":"go.mod"}"#,
+            ],
+        ).unwrap();
+        connection
+            .execute(
+                "UPDATE scan_runs SET coverage_warnings_json=?1 WHERE id=1",
+                [
+                    serde_json::to_string(&[crate::core::scanner::NATIVE_PACKAGE_EVIDENCE_WARNING])
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM performance_metadata WHERE key='scan_match_evidence_v3'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        for _ in 0..2 {
+            let reopened = Database::new(path.clone()).unwrap();
+            let detail = reopened.repo_overview(1).unwrap();
+            assert_eq!(detail.overview.open_finding_count, 5);
+            assert_eq!(detail.overview.opportunity_count, 2);
+            let opportunities = detail
+                .overview
+                .opportunities
+                .iter()
+                .map(|item| item.package_name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(opportunities, ["example.com/manifest", "review-package"]);
+            let finding = detail
+                .findings
+                .iter()
+                .find(|item| item.fingerprint == "bundled-go")
+                .unwrap();
+            assert_eq!(finding.severity, Severity::High);
+            assert_eq!(finding.fix_version, None);
+            let evidence = finding.match_evidence.as_ref().unwrap();
+            assert_eq!(
+                evidence.kind,
+                crate::core::models::FindingMatchKind::GoSymbol
+            );
+            let tool = evidence.bundled_tool.as_ref().unwrap();
+            assert_eq!(tool.package_name.as_deref(), Some("@example/cli"));
+            assert_eq!(tool.component_fix_version.as_deref(), Some("1.0.1"));
+            let fallback = detail
+                .findings
+                .iter()
+                .find(|item| item.fingerprint == "fallback-go")
+                .unwrap();
+            assert_eq!(fallback.fix_version, None);
+            assert_eq!(
+                fallback.match_evidence.as_ref().unwrap().kind,
+                crate::core::models::FindingMatchKind::GoModule
+            );
+            let fallback_npm = detail
+                .findings
+                .iter()
+                .find(|item| item.fingerprint == "fallback-npm")
+                .unwrap();
+            assert_eq!(fallback_npm.fix_version, None);
+            assert_eq!(
+                fallback_npm.match_evidence.as_ref().unwrap().kind,
+                crate::core::models::FindingMatchKind::Unverified
+            );
+            assert_eq!(
+                reopened
+                    .finding_remediation(1, "bundled-go", 1)
+                    .unwrap()
+                    .scanner_reported_target,
+                None
+            );
+        }
+    }
+
+    #[test]
     fn bulk_scan_revision_and_evidence_commit_or_roll_back_together() {
         let temp = tempdir().unwrap();
         let db = Database::new(temp.path().join("bulk-rollback.db")).unwrap();
@@ -9593,6 +9867,7 @@ mod tests {
             fix_version: None,
             title: None,
             source_url: None,
+            match_evidence: None,
             advisory_details: None,
         };
         let package = RepoPackage {
@@ -10712,6 +10987,7 @@ mod tests {
             fix_version: Some("1.0.1".into()),
             title: None,
             source_url: None,
+            match_evidence: None,
             advisory_details: None,
         };
         let evidence = NormalizedRemediationEvidence {
@@ -11151,6 +11427,7 @@ mod tests {
                 fix_version: None,
                 title: None,
                 source_url: None,
+                match_evidence: None,
                 advisory_details: None,
             }
         };
@@ -11772,6 +12049,7 @@ mod tests {
                 fix_version: None,
                 title: None,
                 source_url: None,
+                match_evidence: None,
                 advisory_details: None,
             };
             let package = RepoPackage {
@@ -12280,6 +12558,7 @@ mod tests {
             title: Some("short scanner description".into()),
             source_url: Some("https://github.com/advisories/GHSA-wc8c-qw6v-h7f6".into()),
             package_url: Some("pkg:npm/%40hono/node-server@1.19.9".into()),
+            match_evidence: None,
             advisory_details: Some(crate::core::models::AdvisoryDetails {
                 fetched_at: None,
                 ghsa_id: Some("GHSA-wc8c-qw6v-h7f6".into()),

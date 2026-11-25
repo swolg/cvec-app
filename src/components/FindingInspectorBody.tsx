@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useId, useRef, useState, type ReactNode } fr
 
 import type { FindingRemediationProjection, RepoFinding, ReviewState } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { FINDING_MATCH_LABEL, findingMatchNeedsReview } from "@/lib/findingMatch";
 
 const ReactMarkdown = lazy(() => import("react-markdown"));
 
@@ -23,8 +24,25 @@ export function FindingInspectorBody({ finding, scanResolution, priorityReasons 
   const handoff = chatAction && <Button aria-describedby={chatAction.analysisReason ? reasonId : undefined} size="sm" disabled={chatAction.loading} onClick={chatAction.onOpen}>{chatAction.label}</Button>;
   const analysisReason = chatAction?.analysisReason && <p id={reasonId} className="text-sm text-ink-subtle">{chatAction.analysisReason}</p>;
   const heading = finding.state === "resolved" ? "Historical evidence" : analysisReason ? "Remediation evidence" : "Fix plan";
+  const match = finding.matchEvidence;
+  const needsVerification = findingMatchNeedsReview(match);
+  const bundledTool = match?.bundledTool;
+  const verificationHint = bundledTool ? "Check the npm tool’s releases for an updated binary."
+    : match?.kind === "go_module" ? "Verify the Go module’s source before choosing a repository fix."
+    : "Check applicability to this repository before choosing a fix.";
   return (
     <div className="grid max-w-[72ch] gap-5">
+      {match ? (
+        <section aria-label="Scanner match" className="rounded-lg border border-hairline bg-surface-1 p-3.5">
+          <dl className="grid grid-cols-1 gap-x-3 gap-y-2 text-sm sm:grid-cols-[130px_minmax(0,1fr)]">
+            <Detail label="Match evidence" value={FINDING_MATCH_LABEL[match.kind]} />
+            {match.relativePath ? <Detail label="Detected at" value={match.relativePath} /> : null}
+            {bundledTool ? <Detail label="Bundled in" value={bundledTool.packageName ?? "Installed npm tool"} /> : null}
+            {bundledTool?.componentFixVersion ? <Detail label="Go module fixed in" value={bundledTool.componentFixVersion} /> : null}
+          </dl>
+          {needsVerification ? <p id={scanResolution ? undefined : reasonId} className="mt-2 text-sm text-ink-subtle">{verificationHint}</p> : null}
+        </section>
+      ) : null}
       {scanResolution ? (
         <section className="rounded-lg border border-hairline bg-surface-2 p-3.5">
           <h3 className="text-xs font-semibold uppercase tracking-[.12em] text-ink-subtle">Scan evidence</h3>
@@ -35,7 +53,7 @@ export function FindingInspectorBody({ finding, scanResolution, priorityReasons 
           </dl>
           {handoff ? <div className="mt-3 space-y-2">{analysisReason}{handoff}</div> : null}
         </section>
-      ) : fixPlanEnabled ? <FixPlan heading={heading} finding={finding} remediation={remediation} loading={remediationLoading} loadError={remediationError} onRetry={onRetryRemediation} onOpenManifest={onOpenManifest} handoff={handoff} analysisReason={analysisReason} /> : <section className="rounded-lg border border-hairline bg-surface-2 p-3.5"><h3 className="text-xs font-semibold uppercase tracking-[.12em] text-ink-subtle">{analysisReason ? heading : "Recommended fix"}</h3><p className="mt-1 text-sm font-semibold text-ink">{analysisReason ? finding.packageName : finding.fixVersion ? `Update ${finding.packageName} to ${finding.fixVersion}` : finding.packageName + " · No fixed version is listed."}</p>{handoff ? <div className="mt-3 space-y-2">{analysisReason}{handoff}</div> : null}</section>}
+      ) : needsVerification ? handoff : fixPlanEnabled ? <FixPlan heading={heading} finding={finding} remediation={remediation} loading={remediationLoading} loadError={remediationError} onRetry={onRetryRemediation} onOpenManifest={onOpenManifest} handoff={handoff} analysisReason={analysisReason} /> : <section className="rounded-lg border border-hairline bg-surface-2 p-3.5"><h3 className="text-xs font-semibold uppercase tracking-[.12em] text-ink-subtle">{analysisReason ? heading : "Recommended fix"}</h3><p className="mt-1 text-sm font-semibold text-ink">{analysisReason ? finding.packageName : finding.fixVersion ? `Update ${finding.packageName} to ${finding.fixVersion}` : finding.packageName + " · No fixed version is listed."}</p>{handoff ? <div className="mt-3 space-y-2">{analysisReason}{handoff}</div> : null}</section>}
       {reasons.length ? <section><h3 className="text-xs font-semibold uppercase tracking-[.12em] text-ink-subtle">Why it needs attention</h3><ul className="mt-2 grid gap-1.5">{reasons.map((reason) => <li key={reason} className="flex items-center gap-2 text-sm text-ink-muted"><span aria-hidden className="size-1.5 rounded-full bg-primary" />{reason}</li>)}</ul></section> : null}
       <section><h3 className="text-xs font-semibold uppercase tracking-[.12em] text-ink-subtle">Finding state</h3><dl className="mt-2 grid grid-cols-[110px_minmax(0,1fr)] gap-x-3 gap-y-2 text-sm"><dt className="text-ink-subtle">Scanner state</dt><dd className="capitalize text-ink">{finding.state}</dd>{reviewState ? <><dt className="text-ink-subtle">Review state</dt><dd className="capitalize text-ink">{reviewState}</dd></> : null}{snoozeUntil ? <><dt className="text-ink-subtle">Returns</dt><dd className="text-ink">{new Date(snoozeUntil).toLocaleString()}</dd></> : null}</dl></section>
       {finding.intel ? <section><h3 className="text-xs font-semibold uppercase tracking-[.12em] text-ink-subtle">Advisory source</h3><p className="mt-2 text-sm text-ink-muted">{finding.intel.sources.join(", ")}{finding.intel.severity.toUpperCase() !== finding.severity ? " · Source severity " + finding.intel.severity.toUpperCase() : ""}</p>{finding.intel.fetchedAt ? <p className="mt-1 text-xs text-ink-subtle">Retrieved {new Date(finding.intel.fetchedAt).toLocaleString()}</p> : null}{finding.intel.updatedAt ? <p className="mt-1 text-xs text-ink-subtle">Source updated {new Date(finding.intel.updatedAt).toLocaleString()}</p> : null}</section> : null}

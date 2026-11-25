@@ -418,6 +418,7 @@ fn persistence(root: &Path, runs: usize) {
                 fix_version: Some("1.1.0".into()),
                 title: None,
                 source_url: None,
+                match_evidence: None,
                 advisory_details: None,
             })
             .collect::<Vec<_>>();

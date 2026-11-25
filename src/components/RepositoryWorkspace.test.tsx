@@ -8,9 +8,12 @@ vi.mock("@/lib/api", () => ({
   removeRemoteRepository: vi.fn(),
   listRepositoryAssets: vi.fn(),
   listRepositoryDependencies: vi.fn(),
+  listArtifactScans: vi.fn(),
+  scanArtifact: vi.fn(),
+  getArtifactFindings: vi.fn(),
 }));
 
-import { getRepoOverview, getRepoScanComparison, listRepositoryAssets, listRepositoryDependencies } from "@/lib/api";
+import { getArtifactFindings, getRepoOverview, getRepoScanComparison, listArtifactScans, listRepositoryAssets, listRepositoryDependencies, scanArtifact } from "@/lib/api";
 import type { DependencyPage, RepoAsset, RepoFinding, RepoOverview, RepoPackage, RepoScanRun, RepoSummary } from "@/lib/types";
 import { createEvidenceReads, EvidenceReadsContext } from "@/lib/revisionReadCache";
 import { RepositoryDependencies } from "./RepositoryDependencies";
@@ -114,6 +117,60 @@ describe("RepositoryWorkspace", () => {
     expect(screen.getAllByRole("button", { name: "Scan repo" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("tab", { name: "Overview" }));
     expect(screen.getByRole("heading", { name: "Remediation opportunities" })).toBeInTheDocument();
+  });
+
+  it("shows a build scan and its findings in the selected repository", async () => {
+    const selected = repo(210, "website");
+    vi.mocked(getRepoOverview).mockResolvedValue(detail(selected));
+    vi.mocked(listArtifactScans).mockResolvedValue([]);
+    vi.mocked(scanArtifact).mockResolvedValue({
+      id: 1,
+      repoId: selected.id,
+      summary: {
+        kind: "build_file", name: "release.oci.tar", digest: "a".repeat(64), scannedAt: "2026-11-25T11:00:00Z",
+        platform: "linux/arm64", packageCount: 8, findingCount: 1, coverageWarnings: [],
+      },
+    });
+    vi.mocked(getArtifactFindings).mockResolvedValue({
+      scanId: 1, repoId: selected.id, offset: 0,
+      findings: [{ ...finding("2026-210", "library"), severity: "LOW" }],
+    });
+    const onScanRepo = vi.fn();
+    render(<RepositoryWorkspace isScanning={false} repos={[selected]} selectedRepoId={selected.id} scannerReady schedule="12h" onSelectRepo={() => {}} onSnapshot={() => {}} onScanRepo={onScanRepo} onError={() => {}} onOpenReview={() => {}} />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Artifacts" }));
+    expect(await screen.findByText("No artifact scans yet")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Choose and scan" }));
+    expect(await screen.findByRole("heading", { name: "release.oci.tar" })).toBeInTheDocument();
+    expect(await screen.findByText("CVE-2026-210")).toBeInTheDocument();
+    expect(screen.getByText("LOW")).toBeInTheDocument();
+    expect(scanArtifact).toHaveBeenCalledWith(selected.id, "build_file");
+    expect(getArtifactFindings).toHaveBeenCalledWith(selected.id, 1, 0);
+    expect(onScanRepo).not.toHaveBeenCalled();
+  });
+
+  it("shows .NET declarations from an unresolved GitHub scan alongside its inventory", async () => {
+    const selected = repo(211, "dotnet-project", "github");
+    const overview = detail(selected);
+    overview.nugetProjects = [{
+      path: "src/Example.csproj",
+      frameworks: ["net8.0"],
+      declarations: [{ name: "Example.Lib", requirement: "2.3.4", requirementPath: "Directory.Packages.props", conditional: false }],
+      resolutionPath: null,
+    }];
+    vi.mocked(getRepoOverview).mockResolvedValue(overview);
+    vi.mocked(listRepositoryDependencies).mockResolvedValue({
+      items: [], total: 0, revision: 0, inventoryCount: 0, affectedCount: 0,
+      ecosystems: [], nextCursor: null, scanRunId: selected.id * 10,
+    });
+    const onOpenReview = vi.fn();
+    render(<RepositoryWorkspace isScanning={false} repos={[selected]} selectedRepoId={selected.id} scannerReady schedule="off" onSelectRepo={() => {}} onSnapshot={() => {}} onScanRepo={async () => {}} onError={() => {}} onOpenReview={onOpenReview} />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Dependencies" }));
+    expect(screen.getByRole("heading", { name: ".NET projects" })).toBeInTheDocument();
+    expect(screen.getByText("src/Example.csproj")).toBeInTheDocument();
+    expect(screen.getByText("Example.Lib")).toBeInTheDocument();
+    expect(screen.getByText("Directory.Packages.props")).toBeInTheDocument();
+    expect(screen.getByText("Declarations only")).toBeInTheDocument();
+    expect(onOpenReview).not.toHaveBeenCalled();
   });
 
   it("loads product sources only in Source and updates them with repository evidence", async () => {

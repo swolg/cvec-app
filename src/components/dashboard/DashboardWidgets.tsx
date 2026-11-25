@@ -215,6 +215,7 @@ function WorkspaceStatusWidget({
       value: overview.openMedium,
       color: "var(--status-medium)",
     },
+    { label: "Other severities", value: overview.openOther ?? 0, color: "var(--ink-subtle)" },
   ] as const;
   const totalIssues = issueBreakdown.reduce((sum, item) => sum + item.value, 0);
   const scheduleLabel =
@@ -1172,7 +1173,7 @@ function getMetricData(
       return {
         title: "New findings",
         value: String(
-          overview.newMedium + overview.newHigh + overview.newCritical,
+          overview.newMedium + overview.newHigh + overview.newCritical + (overview.newOther ?? 0),
         ),
         description: "Across the latest repository scans",
         iconClass: "text-ink-subtle",

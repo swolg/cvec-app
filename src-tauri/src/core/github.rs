@@ -1,23 +1,23 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
 
+use flate2::read::GzDecoder;
 use futures::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
+use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use tempfile::TempDir;
 
 use crate::Error;
 
 use super::github_api::GithubApiClient;
 
-const MAX_RELEVANT_FILES: usize = 500;
-const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024;
-const MAX_TOTAL_SIZE: u64 = 50 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+const MAX_FILE_SIZE: u64 = 100 * MIB;
+const MAX_TOTAL_SIZE: u64 = 512 * MIB;
+const MAX_COMPRESSED_SIZE: u64 = 128 * MIB;
 const MAX_CONCURRENT_FILE_FETCHES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +57,7 @@ pub struct MaterializedGithubRepository {
     pub temp_dir: TempDir,
     pub info: GithubRepositoryInfo,
     pub files: Vec<GithubRemoteFile>,
+    pub coverage_gaps: Vec<String>,
 }
 
 impl MaterializedGithubRepository {
@@ -100,6 +101,7 @@ struct RawTreeEntry {
     path: String,
     #[serde(rename = "type")]
     entry_type: String,
+    mode: String,
     sha: String,
     size: Option<u64>,
 }
@@ -145,7 +147,7 @@ pub fn parse_github_url(value: &str) -> Result<GithubRepoRef, Error> {
     })
 }
 
-pub fn is_relevant_remote_path(path: &str) -> bool {
+pub fn is_dependency_input_path(path: &str) -> bool {
     let normalized = path.trim_matches('/').replace('\\', "/");
     if normalized.is_empty()
         || normalized.starts_with(".git/")
@@ -161,22 +163,38 @@ pub fn is_relevant_remote_path(path: &str) -> bool {
     let name_lower = name.to_ascii_lowercase();
 
     if matches!(
-        name,
+        name_lower.as_str(),
         "package.json"
             | "package-lock.json"
             | "npm-shrinkwrap.json"
+            | "bun.lock"
+            | "bun.lockb"
+            | "deno.lock"
             | "yarn.lock"
             | "pnpm-lock.yaml"
             | "pnpm-workspace.yaml"
             | "pyproject.toml"
             | "poetry.lock"
+            | "pylock.toml"
+            | "pdm.lock"
+            | "setup.py"
+            | "setup.cfg"
             | "uv.lock"
-            | "Pipfile"
-            | "Pipfile.lock"
+            | "pipfile"
+            | "pipfile.lock"
+            | "packages.lock.json"
+            | "packages.config"
+            | "project.assets.json"
+            | "nuget.config"
+            | "global.json"
+            | "directory.build.props"
+            | "directory.build.targets"
+            | "directory.packages.props"
+            | "go.work"
             | "go.mod"
             | "go.sum"
-            | "Cargo.toml"
-            | "Cargo.lock"
+            | "cargo.toml"
+            | "cargo.lock"
             | "pom.xml"
             | "build.gradle"
             | "build.gradle.kts"
@@ -185,21 +203,43 @@ pub fn is_relevant_remote_path(path: &str) -> bool {
             | "gradle.lockfile"
             | "composer.json"
             | "composer.lock"
-            | "Gemfile"
-            | "Gemfile.lock"
+            | "gemfile"
+            | "gemfile.lock"
             | "gems.locked"
             | "mix.exs"
             | "mix.lock"
-            | "Dockerfile"
+            | "dockerfile"
             | "docker-compose.yml"
             | "docker-compose.yaml"
             | "compose.yml"
             | "compose.yaml"
             | ".gitlab-ci.yml"
-            | "Jenkinsfile"
-            | "Chart.yaml"
+            | "jenkinsfile"
+            | "chart.yaml"
             | "values.yaml"
     ) {
+        return true;
+    }
+
+    if [
+        ".csproj",
+        ".fsproj",
+        ".vbproj",
+        ".deps.json",
+        ".props",
+        ".targets",
+    ]
+    .iter()
+    .any(|extension| name_lower.ends_with(extension))
+    {
+        return true;
+    }
+    if name_lower.starts_with("packages.") && name_lower.ends_with(".lock.json") {
+        return true;
+    }
+    if name_lower.ends_with(".py.lock")
+        || (name_lower.starts_with("pylock.") && name_lower.ends_with(".toml"))
+    {
         return true;
     }
 
@@ -249,68 +289,83 @@ pub async fn materialize_repository(
         ));
     }
 
-    let mut files = tree
-        .tree
-        .into_iter()
-        .filter(|entry| entry.entry_type == "blob" && is_relevant_remote_path(&entry.path))
-        .map(|entry| GithubRemoteFile {
-            path: entry.path,
-            blob_sha: entry.sha,
-            size: entry.size.unwrap_or(0),
+    let mut entries = BTreeMap::new();
+    let mut coverage_gaps = Vec::new();
+    for entry in tree.tree {
+        match entry.entry_type.as_str() {
+            "blob" => {
+                if entries.insert(entry.path.clone(), entry).is_some() {
+                    return Err(Error::App("GitHub returned a duplicate path.".into()));
+                }
+            }
+            "commit" => coverage_gaps.push(format!(
+                "Submodule contents are unavailable at {}",
+                entry.path
+            )),
+            _ => {}
+        }
+    }
+    validate_file_limits(&entries)?;
+
+    let archive_url = format!(
+        "https://api.github.com/repos/{}/{}/tarball/{}",
+        encode_path_segment(&repo_ref.owner),
+        encode_path_segment(&repo_ref.repo),
+        encode_path_segment(&branch.commit.sha),
+    );
+    let archive = client
+        .get_raw_bytes_checked(&archive_url, "commit archive", |size| {
+            if size > MAX_COMPRESSED_SIZE {
+                return Err(snapshot_size_error());
+            }
+            Ok(())
         })
-        .collect::<Vec<_>>();
-    files.sort_by(|left, right| left.path.cmp(&right.path));
+        .await?;
+    let entries = std::sync::Arc::new(entries);
+    let archive_entries = entries.clone();
+    let (mut snapshot, missing) = crate::runtime::run_io(move || {
+        let mut snapshot = RemoteSnapshot::new()?;
+        let found = snapshot.read_archive(&archive[..], &archive_entries)?;
+        let missing = archive_entries
+            .keys()
+            .filter(|path| !found.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok::<_, Error>((snapshot, missing))
+    })
+    .await
+    .map_err(Error::App)??;
 
-    validate_file_limits(&files)?;
-
-    let temp_dir = tempfile::Builder::new()
-        .prefix("cvec-github-")
-        .tempdir()
-        .map_err(|cause| {
-            Error::App(format!(
-                "failed to create temporary scan directory: {cause}"
-            ))
-        })?;
-
-    let actual_total_size = Arc::new(AtomicU64::new(0));
-    let owner = repo_ref.owner.clone();
-    let repo = repo_ref.repo.clone();
-    let commit_sha = branch.commit.sha.clone();
-    let cache_dir = blob_cache_dir.map(Path::to_path_buf);
-    let downloaded = stream::iter(files.into_iter().map(|file| {
+    // Git attributes can omit files from an archive or substitute their contents.
+    // Use Git's blob endpoint for those tracked files and verify their identities.
+    let downloads = stream::iter(missing.into_iter().map(|path| {
+        let entries = entries.clone();
         let client = client.clone();
-        let owner = owner.clone();
-        let repo = repo.clone();
-        let commit_sha = commit_sha.clone();
-        let cache_dir = cache_dir.clone();
-        let actual_total_size = Arc::clone(&actual_total_size);
         async move {
-            let contents = materialize_file_contents(
-                &client,
-                &owner,
-                &repo,
-                &commit_sha,
-                &file,
-                cache_dir.as_deref(),
-                &actual_total_size,
-            )
-            .await?;
-            Ok::<_, Error>((file, contents))
+            let bytes =
+                load_verified_blob(&client, repo_ref, &entries[&path], blob_cache_dir).await?;
+            Ok::<_, Error>((path, bytes))
         }
     }))
-    .buffer_unordered(MAX_CONCURRENT_FILE_FETCHES)
-    .try_collect::<Vec<_>>()
-    .await?;
-
-    let mut files = Vec::with_capacity(downloaded.len());
-    let mut directories = HashSet::new();
-    for (mut file, contents) in downloaded {
-        file.size = contents.len() as u64;
-        write_materialized_file(temp_dir.path(), &file.path, &contents, &mut directories)?;
-        files.push(file);
+    .buffer_unordered(MAX_CONCURRENT_FILE_FETCHES);
+    futures::pin_mut!(downloads);
+    while let Some((path, bytes)) = downloads.try_next().await? {
+        snapshot.write_entry(&entries[&path], &bytes)?;
     }
-    files.sort_by(|left, right| left.path.cmp(&right.path));
 
+    coverage_gaps.extend(snapshot.finish_links()?);
+    coverage_gaps.append(&mut snapshot.coverage_gaps);
+    coverage_gaps.sort();
+
+    let files = entries
+        .values()
+        .filter(|entry| is_dependency_input_path(&entry.path))
+        .map(|entry| GithubRemoteFile {
+            path: entry.path.clone(),
+            blob_sha: entry.sha.clone(),
+            size: entry.size.unwrap_or(0),
+        })
+        .collect();
     let info = GithubRepositoryInfo {
         owner: repository.owner.login,
         repo: repository.name.clone(),
@@ -321,44 +376,226 @@ pub async fn materialize_repository(
     };
 
     Ok(MaterializedGithubRepository {
-        temp_dir,
+        temp_dir: snapshot.directory,
         info,
         files,
+        coverage_gaps,
     })
 }
 
-async fn materialize_file_contents(
-    client: &GithubApiClient,
-    owner: &str,
-    repo: &str,
-    commit_sha: &str,
-    file: &GithubRemoteFile,
-    blob_cache_dir: Option<&Path>,
-    actual_total_size: &AtomicU64,
-) -> Result<Vec<u8>, Error> {
-    if let Some(cache_path) = blob_cache_path(blob_cache_dir, &file.blob_sha) {
-        if let Ok(contents) = read_cached_blob(&cache_path) {
-            if file.size == 0 || contents.len() as u64 == file.size {
-                reserve_actual_size(&file.path, contents.len() as u64, actual_total_size)?;
-                return Ok(contents);
+struct RemoteSnapshot {
+    directory: TempDir,
+    directories: HashSet<PathBuf>,
+    links: BTreeMap<String, Vec<u8>>,
+    coverage_gaps: Vec<String>,
+}
+
+impl RemoteSnapshot {
+    fn new() -> Result<Self, Error> {
+        Ok(Self {
+            directory: tempfile::Builder::new().prefix("cvec-github-").tempdir()?,
+            directories: HashSet::new(),
+            links: BTreeMap::new(),
+            coverage_gaps: Vec::new(),
+        })
+    }
+
+    fn read_archive(
+        &mut self,
+        compressed: impl Read,
+        entries: &BTreeMap<String, RawTreeEntry>,
+    ) -> Result<BTreeSet<String>, Error> {
+        // Account for TAR headers and padding separately from the Git blob budget.
+        let archive_limit = MAX_TOTAL_SIZE + 64 * MIB;
+        let mut archive = tar::Archive::new(GzDecoder::new(compressed).take(archive_limit));
+        let mut found = BTreeSet::new();
+        let mut prefix = None;
+        for item in archive.entries()? {
+            let mut item = item?;
+            if item.header().entry_type().is_pax_global_extensions() {
+                continue;
+            }
+            let path = item.path()?.into_owned();
+            let mut components = path.components();
+            let Some(Component::Normal(top)) = components.next() else {
+                return Err(Error::App(
+                    "GitHub returned an invalid archive path.".into(),
+                ));
+            };
+            if prefix.get_or_insert_with(|| top.to_os_string()) != top {
+                return Err(Error::App("GitHub returned multiple archive roots.".into()));
+            }
+            let relative = components.as_path().to_str().ok_or_else(|| {
+                Error::App("GitHub returned a path that cannot be read as UTF-8.".into())
+            })?;
+            if relative.is_empty() {
+                continue;
+            }
+            safe_join(self.directory.path(), relative)?;
+            let Some(entry) = entries.get(relative) else {
+                continue;
+            };
+            let entry_type = item.header().entry_type();
+            let contents = if entry.mode == "120000" && entry_type.is_symlink() {
+                item.link_name_bytes().map(|bytes| bytes.into_owned())
+            } else if entry.mode != "120000" && entry_type.is_file() && item.size() <= MAX_FILE_SIZE
+            {
+                let mut bytes = Vec::new();
+                item.read_to_end(&mut bytes)?;
+                Some(bytes)
+            } else {
+                None
+            };
+            if let Some(bytes) = contents.filter(|bytes| verified_blob(entry, bytes)) {
+                if !found.insert(relative.to_owned()) {
+                    return Err(Error::App(
+                        "GitHub returned a duplicate archive entry.".into(),
+                    ));
+                }
+                self.write_entry(entry, &bytes)?;
             }
         }
+        Ok(found)
     }
 
-    let contents =
-        fetch_file_contents(client, owner, repo, commit_sha, &file.path, MAX_TOTAL_SIZE).await?;
-    reserve_actual_size(&file.path, contents.len() as u64, actual_total_size)?;
+    fn write_entry(&mut self, entry: &RawTreeEntry, bytes: &[u8]) -> Result<(), Error> {
+        if entry.mode == "120000" {
+            self.links.insert(entry.path.clone(), bytes.to_vec());
+        } else {
+            if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
+                self.coverage_gaps.push(format!(
+                    "Git LFS contents are unavailable at {}",
+                    entry.path
+                ));
+            }
+            write_materialized_file(
+                self.directory.path(),
+                &entry.path,
+                bytes,
+                &mut self.directories,
+            )?;
+        }
+        Ok(())
+    }
 
-    if let Some(cache_path) = blob_cache_path(blob_cache_dir, &file.blob_sha) {
-        if let Err(cause) = write_cached_blob(&cache_path, &contents) {
-            eprintln!(
-                "Failed to cache GitHub blob {} at {}: {cause}",
-                file.blob_sha,
-                cache_path.display()
-            );
+    fn finish_links(&mut self) -> Result<Vec<String>, Error> {
+        let mut gaps = Vec::new();
+        let root = self.directory.path().canonicalize()?;
+        let mut created = Vec::new();
+        for (path, bytes) in std::mem::take(&mut self.links) {
+            let target = std::str::from_utf8(&bytes).ok().map(Path::new);
+            let relative = Path::new(&path);
+            let Some(target) = target.filter(|target| internal_link(relative, target)) else {
+                gaps.push(format!("Symbolic link target is unavailable at {path}"));
+                continue;
+            };
+            #[cfg(unix)]
+            {
+                let link = safe_join(&root, &path)?;
+                ensure_parent_directories(self.directory.path(), &path, &mut self.directories)?;
+                std::os::unix::fs::symlink(target, &link).map_err(materialized_path_error)?;
+                created.push((path, link));
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = target;
+                gaps.push(format!("Symbolic link target is unavailable at {path}"));
+            }
+        }
+        for (path, link) in created {
+            if !link
+                .canonicalize()
+                .is_ok_and(|target| target.starts_with(&root))
+            {
+                fs::remove_file(link)?;
+                gaps.push(format!("Symbolic link target is unavailable at {path}"));
+            }
+        }
+        Ok(gaps)
+    }
+}
+
+fn internal_link(link: &Path, target: &Path) -> bool {
+    if target.as_os_str().is_empty() {
+        return false;
+    }
+    let mut depth = link
+        .parent()
+        .map_or(0, |parent| parent.components().count());
+    for component in target.components() {
+        match component {
+            Component::Normal(name) if !name.eq_ignore_ascii_case(".git") => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            _ => return false,
         }
     }
-    Ok(contents)
+    true
+}
+
+fn verified_blob(entry: &RawTreeEntry, bytes: &[u8]) -> bool {
+    if entry.size.is_some_and(|size| size != bytes.len() as u64) {
+        return false;
+    }
+    let header = format!("blob {}\0", bytes.len());
+    match entry.sha.len() {
+        40 => {
+            let mut hash = Sha1::new();
+            hash.update(header);
+            hash.update(bytes);
+            super::hashing::lowercase_hex(&hash.finalize()) == entry.sha
+        }
+        64 => {
+            let mut hash = Sha256::new();
+            hash.update(header);
+            hash.update(bytes);
+            super::hashing::lowercase_hex(&hash.finalize()) == entry.sha
+        }
+        _ => false,
+    }
+}
+
+async fn load_verified_blob(
+    client: &GithubApiClient,
+    repo: &GithubRepoRef,
+    entry: &RawTreeEntry,
+    cache: Option<&Path>,
+) -> Result<Vec<u8>, Error> {
+    let cache = blob_cache_path(
+        cache.filter(|_| is_dependency_input_path(&entry.path)),
+        &entry.sha,
+    );
+    if let Some(bytes) = cache
+        .as_deref()
+        .and_then(|path| read_cached_blob(path).ok())
+    {
+        if verified_blob(entry, &bytes) {
+            return Ok(bytes);
+        }
+    }
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/git/blobs/{}",
+        encode_path_segment(&repo.owner),
+        encode_path_segment(&repo.repo),
+        encode_path_segment(&entry.sha),
+    );
+    let bytes = client
+        .get_raw_bytes_checked(&url, &entry.path, |size| {
+            validate_blob_size(&entry.path, size)
+        })
+        .await?;
+    if !verified_blob(entry, &bytes) {
+        return Err(Error::App(format!(
+            "GitHub blob does not match the commit at {}.",
+            entry.path
+        )));
+    }
+    if let Some(path) = cache {
+        if let Err(cause) = write_cached_blob(&path, &bytes) {
+            eprintln!("Failed to cache GitHub blob {}: {cause}", entry.sha);
+        }
+    }
+    Ok(bytes)
 }
 
 fn read_cached_blob(path: &Path) -> io::Result<Vec<u8>> {
@@ -434,22 +671,6 @@ fn blob_cache_path(cache_dir: Option<&Path>, blob_sha: &str) -> Option<PathBuf> 
     valid_sha.then(|| cache_dir.join(blob_sha.to_ascii_lowercase()))
 }
 
-fn reserve_actual_size(
-    path: &str,
-    actual_size: u64,
-    actual_total_size: &AtomicU64,
-) -> Result<(), Error> {
-    validate_actual_file_size(path, actual_size, MAX_TOTAL_SIZE)?;
-    let previous = actual_total_size.fetch_add(actual_size, Ordering::SeqCst);
-    if previous.saturating_add(actual_size) > MAX_TOTAL_SIZE {
-        return Err(Error::App(format!(
-            "GitHub repository files exceed the {} MiB total download limit",
-            MAX_TOTAL_SIZE / 1024 / 1024
-        )));
-    }
-    Ok(())
-}
-
 async fn fetch_repository(
     client: &GithubApiClient,
     repo_ref: &GithubRepoRef,
@@ -492,89 +713,44 @@ async fn fetch_tree(
     client.get_json(&url).await
 }
 
-async fn fetch_file_contents(
-    client: &GithubApiClient,
-    owner: &str,
-    repo: &str,
-    commit_sha: &str,
-    path: &str,
-    remaining_total_size: u64,
-) -> Result<Vec<u8>, Error> {
-    let url = format!(
-        "https://api.github.com/repos/{}/{}/contents/{}?ref={}",
-        encode_path_segment(owner),
-        encode_path_segment(repo),
-        encode_path(path),
-        encode_path_segment(commit_sha)
-    );
-    client
-        .get_raw_bytes_checked(&url, path, |actual_size| {
-            validate_actual_file_size(path, actual_size, remaining_total_size)
-        })
-        .await
-}
-
-fn validate_file_limits(files: &[GithubRemoteFile]) -> Result<(), Error> {
-    if files.is_empty() {
-        return Err(Error::App(
-            "No supported dependency, lock, CI, Docker, Helm, or Terraform files were found in this repository."
-                .into(),
-        ));
+fn validate_file_limits(entries: &BTreeMap<String, RawTreeEntry>) -> Result<(), Error> {
+    let mut total = 0_u64;
+    for (path, entry) in entries {
+        let size = entry.size.ok_or_else(|| {
+            Error::App(format!(
+                "GitHub did not report the size of {path}. Scan a local checkout."
+            ))
+        })?;
+        validate_blob_size(path, size)?;
+        total = total.saturating_add(size);
     }
-    if files.len() > MAX_RELEVANT_FILES {
-        return Err(Error::App(format!(
-            "This repository has {} relevant files. The remote scan limit is {MAX_RELEVANT_FILES}.",
-            files.len()
-        )));
+    if total > MAX_TOTAL_SIZE {
+        return Err(snapshot_size_error());
     }
-
-    let mut total_size = 0u64;
-    for file in files {
-        if file.size > MAX_FILE_SIZE {
-            return Err(Error::App(format!(
-                "{} is too large for remote scanning. Maximum file size is 5 MB.",
-                file.path
-            )));
-        }
-        total_size = total_size.saturating_add(file.size);
-    }
-    if total_size > MAX_TOTAL_SIZE {
-        return Err(Error::App(
-            "The relevant files exceed the 50 MB remote scan limit.".into(),
-        ));
-    }
-
     Ok(())
 }
 
-fn validate_actual_file_size(
-    path: &str,
-    actual_size: u64,
-    remaining_total_size: u64,
-) -> Result<(), Error> {
-    if actual_size > MAX_FILE_SIZE {
+fn validate_blob_size(path: &str, size: u64) -> Result<(), Error> {
+    if size > MAX_FILE_SIZE {
         return Err(Error::App(format!(
-            "{path} is too large for remote scanning. Maximum file size is 5 MB."
+            "GitHub file {path} exceeds the 100 MiB download limit. Scan a local checkout."
         )));
     }
-    if actual_size > remaining_total_size {
-        return Err(Error::App(format!(
-            "The relevant files exceed the 50 MB remote scan limit while downloading {path}."
-        )));
-    }
-
     Ok(())
+}
+
+fn snapshot_size_error() -> Error {
+    Error::App("The GitHub snapshot exceeds the download budget. Scan a local checkout to cover this repository.".into())
 }
 
 fn safe_join(root: &Path, relative_path: &str) -> Result<PathBuf, Error> {
     let relative = Path::new(relative_path);
     if relative_path.is_empty()
         || relative_path.contains('\\')
+        || relative_path.chars().any(char::is_control)
         || relative.components().any(|component| !matches!(component, Component::Normal(name) if !name.eq_ignore_ascii_case(".git")))
     {
-        return Err(Error::App(format!(
-            "GitHub returned an unsafe file path: {relative_path}"
-        )));
+        return Err(Error::App("GitHub returned an unsafe file path.".into()));
     }
     Ok(root.join(relative))
 }
@@ -586,6 +762,21 @@ fn write_materialized_file(
     directories: &mut HashSet<PathBuf>,
 ) -> Result<(), Error> {
     let target = safe_join(root, relative)?;
+    ensure_parent_directories(root, relative, directories)?;
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(target)
+        .map_err(materialized_path_error)?
+        .write_all(bytes)?;
+    Ok(())
+}
+
+fn ensure_parent_directories(
+    root: &Path,
+    relative: &str,
+    directories: &mut HashSet<PathBuf>,
+) -> Result<(), Error> {
     if let Some(parent) = Path::new(relative).parent() {
         let mut directory = root.to_path_buf();
         for component in parent.components() {
@@ -596,12 +787,6 @@ fn write_materialized_file(
             }
         }
     }
-    fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(target)
-        .map_err(materialized_path_error)?
-        .write_all(bytes)?;
     Ok(())
 }
 
@@ -629,13 +814,6 @@ fn is_valid_repo(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-fn encode_path(path: &str) -> String {
-    path.split('/')
-        .map(encode_path_segment)
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn encode_path_segment(segment: &str) -> String {
@@ -726,10 +904,13 @@ mod tests {
     }
 
     #[test]
-    fn matches_relevant_remote_paths() {
+    fn recognizes_dependency_metadata_for_source_verification() {
         for path in [
             "package-lock.json",
             "apps/web/package.json",
+            "apps/web/bun.lock",
+            "apps/native/A.csproj",
+            "apps/native/packages.lock.json",
             "requirements-dev.txt",
             "pyproject.toml",
             "uv.lock",
@@ -744,7 +925,7 @@ mod tests {
             "terraform/main.tf",
             "Chart.yaml",
         ] {
-            assert!(is_relevant_remote_path(path), "{path}");
+            assert!(is_dependency_input_path(path), "{path}");
         }
 
         for path in [
@@ -754,25 +935,92 @@ mod tests {
             "../package.json",
             ".git/config",
         ] {
-            assert!(!is_relevant_remote_path(path), "{path}");
+            assert!(!is_dependency_input_path(path), "{path}");
         }
     }
 
     #[test]
-    fn rejects_actual_file_over_remote_scan_limit() {
-        let result =
-            validate_actual_file_size("package-lock.json", MAX_FILE_SIZE + 1, MAX_TOTAL_SIZE);
-
-        assert!(result.is_err());
+    fn archive_materializes_files_outside_the_manifest_list_and_checks_blob_hashes() {
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+        let mut metadata = tar::Header::new_gnu();
+        metadata.set_entry_type(tar::EntryType::XGlobalHeader);
+        metadata.set_size(0);
+        archive
+            .append_data(&mut metadata, "pax_global_header", io::empty())
+            .unwrap();
+        let mut entries = BTreeMap::new();
+        for (path, archived, committed) in [
+            (
+                "src/generated.deps.json",
+                b"resolved".as_slice(),
+                b"resolved".as_slice(),
+            ),
+            (
+                "src/module.example",
+                b"arbitrary source".as_slice(),
+                b"arbitrary source".as_slice(),
+            ),
+            (
+                "src/substituted.txt",
+                b"different".as_slice(),
+                b"committed".as_slice(),
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(archived.len() as u64);
+            archive
+                .append_data(&mut header, format!("fixture/{path}"), archived)
+                .unwrap();
+            let mut hash = Sha1::new();
+            hash.update(format!("blob {}\0", committed.len()));
+            hash.update(committed);
+            entries.insert(
+                path.to_owned(),
+                RawTreeEntry {
+                    path: path.to_owned(),
+                    entry_type: "blob".into(),
+                    mode: "100644".into(),
+                    sha: super::super::hashing::lowercase_hex(&hash.finalize()),
+                    size: Some(committed.len() as u64),
+                },
+            );
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        let mut snapshot = RemoteSnapshot::new().unwrap();
+        let found = snapshot.read_archive(bytes.as_slice(), &entries).unwrap();
+        assert_eq!(
+            found,
+            BTreeSet::from([
+                "src/generated.deps.json".to_owned(),
+                "src/module.example".to_owned()
+            ])
+        );
+        assert!(!snapshot
+            .directory
+            .path()
+            .join("src/substituted.txt")
+            .exists());
+        assert_eq!(
+            fs::read(snapshot.directory.path().join("src/module.example")).unwrap(),
+            b"arbitrary source"
+        );
+        assert!(!internal_link(
+            Path::new("src/package.json"),
+            Path::new("../../package.json")
+        ));
+        assert!(internal_link(
+            Path::new("src/package.json"),
+            Path::new("../package.json")
+        ));
     }
 
     #[test]
-    fn rejects_actual_size_over_remaining_remote_scan_limit() {
-        // Used both during streaming (in get_raw_bytes_checked) and as final guard
-        // after fetch_file_contents has returned the real bytes.
-        let result = validate_actual_file_size("package-lock.json", 2, 1);
-
-        assert!(result.is_err());
+    fn rejects_files_over_the_remote_download_budget() {
+        assert!(validate_blob_size("package-lock.json", MAX_FILE_SIZE + 1).is_err());
     }
 
     #[cfg(unix)]

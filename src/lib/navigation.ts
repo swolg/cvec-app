@@ -36,7 +36,7 @@ export interface WorkspaceContext {
   inspectorKey?: string;
   focusKey?: string;
   boardScrollLeft?: number;
-  repositorySection?: "overview" | "dependencies" | "history" | "chat" | "settings";
+  repositorySection?: "overview" | "dependencies" | "history" | "artifacts" | "chat" | "settings";
   repositoryScrollAnchor?: string;
   repositoryQuery?:string;
   repositorySort?:"attention"|"freshness"|"changes"|"name";

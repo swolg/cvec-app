@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { z } from "zod";
-import type { FixArchivePage, FixSnapshot, FixWorkspace, FixStartRequest } from "./types";
+import { SEVERITIES, type FixArchivePage, type FixSnapshot, type FixWorkspace, type FixStartRequest } from "./types";
 
 const short = z.string().max(4096);
 const digest = z.string().regex(/^[a-f0-9]{64}$/);
-const finding = z.strictObject({ fingerprint: short, advisoryId: short, packageName: short, version: short.nullable(), packageType: short.nullable(), packageUrl: short.nullable(), fixVersion: short.nullable(), severity: z.enum(["MEDIUM", "HIGH", "CRITICAL"]) });
+const finding = z.strictObject({ fingerprint: short, advisoryId: short, packageName: short, version: short.nullable(), packageType: short.nullable(), packageUrl: short.nullable(), fixVersion: short.nullable(), severity: z.enum(SEVERITIES) });
 const check = z.strictObject({ action: short, status: z.enum(["passed", "failed", "unavailable", "interrupted"]), exitCode: z.number().int().nullable(), output: z.string().max(128 * 1024), digest, stale: z.boolean(), finishedAt: short });
 const rescan = z.strictObject({ findings: z.array(finding).max(500), findingCount: z.number().int().nonnegative(), notDetected: z.number().int().nonnegative().nullable(), targetDetected: z.boolean().nullish(), digest, stale: z.boolean(), scannedAt: short, scannerVersions: short });
 const provider = z.strictObject({ connectionId: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/), driver: z.enum(["codex", "grok", "open_code"]), displayName: short, model: z.string().max(256).nullable() });
