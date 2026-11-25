@@ -1,4 +1,5 @@
-import type { ReviewActionBasis, ReviewFinding, ReviewGroupCounts, ReviewLaneCount, ReviewState, RepoFinding, Severity } from "./types";
+import { severityLabel } from "./format";
+import { SEVERITIES, type ReviewActionBasis, type ReviewFinding, type ReviewGroupCounts, type ReviewLaneCount, type ReviewState, type RepoFinding } from "./types";
 import type { ReviewGrouping } from "./reviewViews";
 
 export interface ReviewLane {
@@ -77,7 +78,10 @@ export function projectReviewLanes(items: ReviewFinding[], grouping: Exclude<Rev
   if (grouping === "reviewState") return fixedLanes(canonical, [
     ["unreviewed", "Needs review"], ["reviewed", "Reviewed"], ["snoozed", "Snoozed"],
   ], (item) => item.reviewState, true, groupCounts?.reviewState);
-  if (grouping === "severity") return fixedLanes(canonical, [["CRITICAL", "Critical"], ["HIGH", "High"], ["MEDIUM", "Medium"]] satisfies [Severity, string][], (item) => item.finding.severity, false, groupCounts?.severity);
+  if (grouping === "severity") {
+    return fixedLanes(canonical, SEVERITIES.map((severity) => [severity, severityLabel(severity)] as const), (item) => item.finding.severity, false, groupCounts?.severity)
+      .filter((lane, index) => index < 3 || lane.totalCount > 0);
+  }
   if (grouping === "fixAvailability") return fixedLanes(canonical, [["available", "Fix available"], ["unavailable", "No fix listed"]], (item) => item.finding.fixVersion ? "available" : "unavailable", false, groupCounts?.fixAvailability);
   const repositoryBuckets = new Map<string, ReviewFinding[]>();
   const repositoryNames = new Map<string, string>();

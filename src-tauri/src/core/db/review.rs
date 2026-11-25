@@ -96,7 +96,7 @@ const FINDING_COLUMNS: &str = r#"
     v.id vulnerability_id,v.repo_id,rr.repo_name,rr.source_type,rr.previous_id,
     rr.preferred_evidence_id,v.scan_run_id recorded_scan_id,v.fingerprint,v.advisory_id,
     v.package_name,v.package_version,v.package_type,v.package_url,v.severity,v.fix_version,
-    v.title,v.source_url,v.advisory_severity
+    v.title,v.source_url,v.advisory_severity,v.match_evidence_json
 "#;
 
 const ACTIVE_FINDING_STATE: &str = r#"
@@ -127,14 +127,14 @@ const ADVISORY_FACTS: &str = r#"
       UNION ALL SELECT lower(source_item_id),id FROM external_advisories
       UNION ALL SELECT lower(alias),advisory_id FROM external_advisory_aliases
     ), exploitation AS MATERIALIZED (
-      SELECT i.identity,MAX(ea.is_ransomware_known)*2+MAX(ea.is_kev) score,MAX(CASE upper(ea.severity) WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 1 ELSE 0 END) source_rank
+      SELECT i.identity,MAX(ea.is_ransomware_known)*2+MAX(ea.is_kev) score,MAX(cvec_severity_rank(ea.severity)) source_rank
       FROM identities i JOIN external_advisories ea ON ea.id=i.id GROUP BY i.identity
     )
 "#;
 const EXPLOITATION_FLAGS: &str =
     "exploitation_score%2 known_exploited,exploitation_score>=2 ransomware_known";
-const REVIEW_RISK_RANK: &str = "MAX(CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 ELSE 1 END,
-    source_rank,CASE upper(advisory_severity) WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 WHEN 'MEDIUM' THEN 1 ELSE 0 END)";
+const REVIEW_RISK_RANK: &str =
+    "MAX(cvec_severity_rank(severity),source_rank,cvec_severity_rank(advisory_severity))";
 fn review_finding_reappeared() -> String {
     finding_reappeared(
         "f",
@@ -195,7 +195,7 @@ fn review_relation(canonical: &str, include_scan_changes: bool) -> String {
       SELECT f.*,s.finished_at scanned_at,COALESCE(s.finished_at,'') scanned_key,
         {EXPLOITATION_FLAGS},
         CASE WHEN exploitation_score>=2 THEN 2 ELSE exploitation_score END exploitation_rank,
-        CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 ELSE 1 END severity_rank,
+        cvec_severity_rank(severity) severity_rank,
         {REVIEW_RISK_RANK} risk_rank,
         CASE scanner_state WHEN 'new' THEN 2 WHEN 'open' THEN 1 ELSE 0 END scanner_rank,
         CASE material_change WHEN 'reappeared' THEN 4 WHEN 'severity_increased' THEN 3
@@ -586,8 +586,8 @@ pub(super) fn repo_finding_preview(
         WITH repo_runs AS (SELECT ?1 repo_id, ?3 previous_id)
         {RUNS_WITH_PRIOR}, preview AS MATERIALIZED (
             SELECT fingerprint, advisory_id, package_name, package_version, package_type,
-                   package_url, severity, fix_version, title, source_url,
-                   CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 ELSE 1 END severity_rank
+                   package_url, severity, fix_version, title, source_url, match_evidence_json,
+                   cvec_severity_rank(severity) severity_rank
             FROM vulnerabilities
             WHERE repo_id=?1 AND scan_run_id=?2
             ORDER BY severity_rank DESC, advisory_id, fingerprint
@@ -610,10 +610,13 @@ fn map_repo_finding(row: &Row<'_>) -> rusqlite::Result<RepoFinding> {
         package_version: row.get("package_version")?,
         package_type: row.get("package_type")?,
         package_url: row.get("package_url")?,
-        severity: Severity::parse(row.get_ref("severity")?.as_str()?).unwrap_or(Severity::Medium),
+        severity: Severity::parse(row.get_ref("severity")?.as_str()?).unwrap_or(Severity::Unknown),
         fix_version: row.get("fix_version")?,
         title: row.get("title")?,
         source_url: row.get("source_url")?,
+        match_evidence: row
+            .get::<_, Option<String>>("match_evidence_json")?
+            .and_then(|value| serde_json::from_str(&value).ok()),
         state: parse_finding_state(row.get_ref("scanner_state")?.as_str()?),
         intel: None,
         review_state: ReviewState::Unreviewed,
@@ -628,11 +631,7 @@ pub(super) fn map_item(row: &Row<'_>) -> rusqlite::Result<ReviewFinding> {
     let severity = finding.severity;
     let advisory_rank = row.get::<_, u8>("risk_rank")?;
     let advisory_severity = if advisory_rank > severity_rank(&severity) {
-        match advisory_rank {
-            3 => Some(Severity::Critical),
-            2 => Some(Severity::High),
-            _ => Some(Severity::Medium),
-        }
+        Severity::from_rank(advisory_rank)
     } else {
         None
     };
@@ -698,6 +697,9 @@ fn groups(
           COUNT(*) FILTER (WHERE severity='CRITICAL'),
           COUNT(*) FILTER (WHERE severity='HIGH'),
           COUNT(*) FILTER (WHERE severity='MEDIUM'),
+          COUNT(*) FILTER (WHERE severity='LOW'),
+          COUNT(*) FILTER (WHERE severity='NEGLIGIBLE'),
+          COUNT(*) FILTER (WHERE cvec_severity_rank(severity)<=1),
           COUNT(*) FILTER (WHERE fix_available),
           COUNT(*) FILTER (WHERE NOT fix_available)
         FROM review WHERE {clause} GROUP BY repo_id"#
@@ -898,7 +900,7 @@ impl Database {
             "{facts} SELECT f.repo_id, f.fingerprint
              FROM facts f JOIN finding_reviews fr ON fr.repo_id=f.repo_id AND fr.fingerprint=f.fingerprint
              WHERE f.scanner_state<>'resolved' AND (
-                {REVIEW_RISK_RANK} > CASE fr.basis_severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 ELSE 1 END
+                {REVIEW_RISK_RANK} > cvec_severity_rank(fr.basis_severity)
                 OR (fr.basis_known_exploited=0 AND f.exploitation_score%2=1)
                 OR (fr.basis_ransomware_known=0 AND f.exploitation_score>=2)
                 OR (f.fix_version IS NOT NULL AND f.fix_version IS NOT fr.basis_fix_version)

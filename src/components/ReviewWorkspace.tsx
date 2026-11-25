@@ -8,7 +8,8 @@ import { reviewSessionCache } from "@/lib/reviewPageCache";
 import { remediationProjectionCache } from "@/lib/remediationProjectionCache";
 import { useReviewController } from "@/hooks/useReviewController";
 import type { FindingChatRequest, FindingRemediationProjection, ReviewFinding, ReviewFilters, ReviewQuery, ReviewSort, ReviewState, ReviewUpdate, Severity } from "@/lib/types";
-import { formatRelativeTimestamp } from "@/lib/format";
+import { SEVERITIES } from "@/lib/types";
+import { formatRelativeTimestamp, severityLabel } from "@/lib/format";
 import { AppIcon } from "./ui/app-icon";
 import { Badge } from "./ui/badge";
 import { Button, IconButton } from "./ui/button";
@@ -17,6 +18,7 @@ import { Input, SearchField, Select } from "./ui/form-controls";
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "./ui/overlays";
 import { WorkList, type WorkListColumn } from "./ui/work-list";
 import { FindingInspectorBody } from "./FindingInspectorBody";
+import { findingMatchNeedsReview } from "@/lib/findingMatch";
 import type { WorkspaceContext } from "@/lib/navigation";
 import { CvecReviewTable } from "./review/CvecReviewTable";
 import { CvecReviewBoard } from "./review/CvecReviewBoard";
@@ -481,7 +483,7 @@ export function ReviewWorkspace({ viewsState, onViewsStateChange, initialViewId,
           <Popover><PopoverTrigger render={<Button className="shrink-0" variant="secondary" />}><AppIcon className="size-4" icon={Funnel} />Filters{activeFilterCount ? <Badge variant="secondary">{activeFilterCount}</Badge> : null}</PopoverTrigger><PopoverContent align="end" className="grid w-72 gap-3"><PopoverTitle className="font-semibold">Filter Review</PopoverTitle><Select label="Severity" value={severityFilter || "all"} onValueChange={(value) => {
             const severities = value === "all" ? [] : value.split(",") as Severity[];
             setQuery((current) => ({ ...current, cursor: null, filters: { ...current.filters, severities } }));
-          }}><option value="all">Any severity</option>{query.filters.severities.length > 1 ? <option value={severityFilter}>{query.filters.severities.map((severity) => severity[0] + severity.slice(1).toLowerCase()).join(" and ")}</option> : null}<option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option></Select><Select label="Review state" value={query.filters.reviewStates[0] ?? "all"} disabled={reviewStateRestricted} disabledReason={reviewStateRestricted ? "Snoozed findings return to this queue at their scheduled time." : undefined} onValueChange={(value) => updateReviewState(value as ReviewState | "all")}><option value="all">Any review state</option><option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option><option value="snoozed">Snoozed</option></Select><Select label="Fix availability" value={query.filters.fixAvailable === null ? "all" : String(query.filters.fixAvailable)} onValueChange={(value) => setQuery((current) => ({ ...current, cursor: null, filters: { ...current.filters, fixAvailable: value === "all" ? null : value === "true" } }))}><option value="all">Any fix state</option><option value="true">Fix available</option><option value="false">No fix listed</option></Select></PopoverContent></Popover>
+          }}><option value="all">Any severity</option>{query.filters.severities.length > 1 ? <option value={severityFilter}>{query.filters.severities.map((severity) => severity[0] + severity.slice(1).toLowerCase()).join(" and ")}</option> : null}{SEVERITIES.map((severity) => <option key={severity} value={severity}>{severityLabel(severity)}</option>)}</Select><Select label="Review state" value={query.filters.reviewStates[0] ?? "all"} disabled={reviewStateRestricted} disabledReason={reviewStateRestricted ? "Snoozed findings return to this queue at their scheduled time." : undefined} onValueChange={(value) => updateReviewState(value as ReviewState | "all")}><option value="all">Any review state</option><option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option><option value="snoozed">Snoozed</option></Select><Select label="Fix availability" value={query.filters.fixAvailable === null ? "all" : String(query.filters.fixAvailable)} onValueChange={(value) => setQuery((current) => ({ ...current, cursor: null, filters: { ...current.filters, fixAvailable: value === "all" ? null : value === "true" } }))}><option value="all">Any fix state</option><option value="true">Fix available</option><option value="false">No fix listed</option></Select></PopoverContent></Popover>
           <Select containerClassName="min-w-40 flex-1 xl:min-w-0" aria-label="Sort review findings" value={query.sort} onValueChange={(value) => changePrimarySort(value as ReviewSort)}><option value="priority">Priority</option><option value="severity">Severity</option><option value="recent">Recent</option><option value="repository">Repository</option><option value="package">Package</option></Select>
           {reviewSurfaceV2 ? <ReviewPresentationControls presentation={presentation} dirty={presentationDirty} onChange={updatePresentation} onReset={() => updatePresentation(structuredClone(activeView.presentation))} /> : null}
           <Button className="shrink-0" variant="secondary" onClick={() => { setSaveName(`${activeView.name} copy`); setSaveOpen(true); }}><AppIcon className="size-4" icon={FloppyDisk} />Save view</Button>
@@ -643,7 +645,7 @@ function FindingInspector({ item, headingRef, resolvedInScanRunId, dataRevision,
   const currentRemediation = settledRemediationKey === remediationRequestKey && remediation?.repoId === item.repoId && remediation.fingerprint === finding.fingerprint && remediation.evidenceScanRunId === item.scanRunId ? remediation : null;
   const detailState = item.finding.intel || !item.scanRunId || loadedDetailKey === detailRequestKey ? "ready" : detailError ? "error" : "loading";
   const remediationState = !fixPlanEnabled ? "disabled" : !item.scanRunId ? "unavailable" : settledRemediationKey !== remediationRequestKey || remediationLoading ? "loading" : currentRemediation ? "ready" : "error";
-  const targetVersion = currentRemediation?.scannerReportedTarget ?? finding.fixVersion;
+  const targetVersion = findingMatchNeedsReview(finding.matchEvidence) ? null : currentRemediation?.scannerReportedTarget ?? finding.fixVersion;
   const canPlanFix = !historical && finding.state !== "resolved" && item.repoSourceType === "local"
     && Boolean(targetVersion && item.scanRunId);
   const canFix = canPlanFix && currentRemediation && currentRemediation.evidenceQuality !== "stale"
@@ -657,6 +659,7 @@ function FindingInspector({ item, headingRef, resolvedInScanRunId, dataRevision,
       : historical || finding.state === "resolved" ? "Inspect the scan that recorded this historical finding."
       : item.repoSourceType === "github" ? "A fix needs a local checkout. You can analyze the linked repository’s scan here."
       : item.repoSourceType !== "local" ? "A fix needs a local Git checkout."
+      : finding.matchEvidence?.bundledTool ? "Check the npm tool that ships this Go component."
       : !targetVersion ? "The scanner has no fixed version for this package."
       : "A current scan with verifiable fix evidence is needed to start a fix.",
     onOpen: () => onContinueInChat({

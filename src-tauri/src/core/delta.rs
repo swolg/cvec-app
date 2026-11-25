@@ -128,7 +128,10 @@ pub(super) fn same_scan_package(
         right_url.and_then(purl_without_version),
     ) {
         (Some(left), Some(right)) => left == right,
-        _ => !matches!((left_type, right_type), (Some(left), Some(right)) if left != right),
+        (None, None) if left_url.is_none() && right_url.is_none() => {
+            matches!((left_type, right_type), (Some(left), Some(right)) if left == right && !matches!(left, "" | "unknown"))
+        }
+        _ => false,
     }
 }
 
@@ -188,6 +191,7 @@ fn increment_new_counter(summary: &mut DeltaSummary, severity: &Severity) {
         Severity::Medium => summary.new_medium_count += 1,
         Severity::High => summary.new_high_count += 1,
         Severity::Critical => summary.new_critical_count += 1,
+        Severity::Low | Severity::Negligible | Severity::Unknown => summary.new_other_count += 1,
     }
 }
 
@@ -196,15 +200,14 @@ fn increment_resolved_counter(summary: &mut DeltaSummary, severity: &Severity) {
         Severity::Medium => summary.resolved_medium_count += 1,
         Severity::High => summary.resolved_high_count += 1,
         Severity::Critical => summary.resolved_critical_count += 1,
+        Severity::Low | Severity::Negligible | Severity::Unknown => {
+            summary.resolved_other_count += 1
+        }
     }
 }
 
 fn severity_rank(severity: &Severity) -> u8 {
-    match severity {
-        Severity::Medium => 1,
-        Severity::High => 2,
-        Severity::Critical => 3,
-    }
+    severity.rank()
 }
 
 #[cfg(test)]
@@ -223,6 +226,7 @@ mod tests {
             title: None,
             source_url: None,
             package_url: None,
+            match_evidence: None,
             advisory_details: None,
         }
     }

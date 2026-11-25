@@ -4,7 +4,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
 
@@ -14,19 +14,23 @@ use tokio::process::Command as AsyncCommand;
 
 use crate::Error;
 
-use super::delta::build_fingerprint;
 use super::models::{
     GrypeDbStatus, NormalizedFinding, NormalizedRemediationEvidence, RemediationEvidenceQuality,
     RemediationEvidenceSource, RemediationLocationKind, RemediationRelationship, RepoPackage,
-    ScanOutput, ScannerAvailability, ScannerVersions, Severity, SourceSnapshot,
-    REMEDIATION_SCHEMA_VERSION,
+    ScanOutput, ScannerAvailability, ScannerVersions, SourceSnapshot, REMEDIATION_SCHEMA_VERSION,
 };
 use super::secure_fs::read_regular_text;
 #[cfg(unix)]
 use super::secure_fs::AnchoredRoot;
 
+mod artifact;
+mod grype_report;
 mod inputs;
 mod npm_coverage;
+mod nuget_coverage;
+mod nuget_manifest;
+
+pub(crate) use artifact::scan_artifact;
 
 const TRUSTED_TOOL_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
 const SCAN_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -39,6 +43,8 @@ const MAX_SUPPORTED_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SUPPORTED_MANIFEST_DECLARATIONS: usize = 10_000;
 #[cfg(debug_assertions)]
 const QA_TRUSTED_TOOL_DIRS_ENV: &str = "CVEC_SCANNER_TOOL_DIRS";
+pub(crate) const NATIVE_PACKAGE_EVIDENCE_WARNING: &str =
+    "Syft did not provide native package evidence. Update Syft for full artifact and Go symbol matching.";
 
 pub fn availability() -> ScannerAvailability {
     let syft = resolve_tool("syft");
@@ -253,10 +259,17 @@ where
     })?;
     let ScanInventory {
         cyclonedx,
-        companion,
-        packages,
-        evidence,
+        mut companion,
+        mut packages,
+        mut evidence,
+        additional_artifacts,
     } = inventory_repository(path, &syft, grype_db_cache_dir).await?;
+    if !additional_artifacts.is_empty() {
+        companion =
+            crate::runtime::run(move || augment_native_inventory(companion, additional_artifacts))
+                .await
+                .map_err(Error::Scanner)??;
+    }
     if let Some(started) = inventory_started {
         eprintln!(
             "cvec-perf scanner cyclonedx_bytes={} evidence_bytes={} inventory_ms={:.3}",
@@ -267,40 +280,42 @@ where
     }
     let matching_started = trace.then(std::time::Instant::now);
     on_stage(super::models::ScanActivityStage::MatchingVulnerabilities);
-    let mut grype_command = async_command_for("grype", grype_db_cache_dir)?;
-    // Read the report over IPC pipes regardless of standalone CLI output
-    // and severity-threshold settings. Keep built-in matcher exclusions.
-    grype_command
-        .args(["--file=", "--fail-on=", "-o", "json"])
-        .env("GRYPE_INCLUDE_MATCHER_SUPPRESSIONS", "false")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = super::process::output(
-        grype_command,
-        Some(&cyclonedx),
-        SCAN_COMMAND_TIMEOUT,
-        MAX_COMPANION_BYTES as usize,
+    let output = grype_output(
+        companion.as_deref().unwrap_or(&cyclonedx),
+        grype_db_cache_dir,
     )
     .await?;
     if let Some(started) = matching_started {
         eprintln!(
             "cvec-perf scanner grype_bytes={} matching_ms={:.3}",
-            output.stdout.len(),
+            output.len(),
             started.elapsed().as_secs_f64() * 1000.0
         );
-    }
-    if !output.status.success() {
-        return Err(Error::Scanner(format!(
-            "grype failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
     }
 
     let path = path.to_path_buf();
     crate::runtime::run(move || -> Result<ScanOutput, Error> {
-        let findings = parse_grype_json(&output.stdout)?;
+        let source = companion
+            .as_deref()
+            .map(grype_report::SourceInventory::parse)
+            .transpose()?;
+        let findings = if let Some(source) = source {
+            let findings =
+                grype_report::parse(&output, Some(grype_report::Verification::Native(&source)))?;
+            source.include_packages(&mut packages);
+            findings
+        } else {
+            let source = grype_report::SourceInventory::parse_cyclonedx(&cyclonedx)?;
+            let findings = grype_report::parse(
+                &output,
+                Some(grype_report::Verification::CycloneDx {
+                    packages: &packages,
+                    source: &source,
+                }),
+            )?;
+            evidence.record_coverage_gaps([NATIVE_PACKAGE_EVIDENCE_WARNING.into()]);
+            findings
+        };
         let mut remediation_evidence = companion
             .as_deref()
             .and_then(|bytes| parse_syft_remediation_evidence(bytes, &path).ok())
@@ -319,6 +334,29 @@ where
     })
     .await
     .map_err(Error::Scanner)?
+}
+
+async fn grype_output(sbom: &[u8], grype_db_cache_dir: Option<&Path>) -> Result<Vec<u8>, Error> {
+    let mut grype_command = async_command_for("grype", grype_db_cache_dir)?;
+    // Read the report over IPC pipes regardless of standalone CLI output
+    // and severity-threshold settings. Keep built-in matcher exclusions.
+    grype_command
+        .args(["--file=", "--fail-on=", "-o", "json"])
+        .env("GRYPE_INCLUDE_MATCHER_SUPPRESSIONS", "false")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = super::process::output(
+        grype_command,
+        Some(sbom),
+        SCAN_COMMAND_TIMEOUT,
+        MAX_COMPANION_BYTES as usize,
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(command_failed("grype", output.status));
+    }
+    Ok(output.stdout)
 }
 
 async fn active_syft_configuration(tool: &Path) -> Option<Vec<u8>> {
@@ -392,30 +430,65 @@ struct ScanInventory {
     companion: Option<Vec<u8>>,
     packages: Vec<RepoPackage>,
     evidence: ScanEvidence,
+    additional_artifacts: Vec<Value>,
 }
 
 impl ScanInventory {
     fn parse(
         cyclonedx: Vec<u8>,
         companion: Option<Vec<u8>>,
-        evidence: ScanEvidence,
+        mut evidence: ScanEvidence,
     ) -> Result<Self, Error> {
-        let (packages, npm_coverage, python_coverage) = parse_cyclonedx_inventory(&cyclonedx)?;
-        npm_coverage.verify(&evidence.inputs)?;
-        inputs::verify_cargo_and_python(&evidence.inputs, &packages, &python_coverage)?;
+        let (packages, npm_coverage, python_coverage, nuget_coverage, cargo_coverage) =
+            parse_cyclonedx_inventory(&cyclonedx)?;
+        evidence.record_coverage_gaps(npm_coverage.verify(&evidence.inputs)?);
+        evidence.record_coverage_gaps(inputs::verify_cargo_and_python(
+            &evidence.inputs,
+            &cargo_coverage,
+            &python_coverage,
+        )?);
+        let nuget = nuget_coverage.resolve(&evidence.inputs, companion.is_some())?;
+        evidence.record_coverage_gaps(nuget.warnings);
+        evidence.nuget_projects = nuget.projects;
         Ok(Self {
             cyclonedx,
             companion,
             packages,
             evidence,
+            additional_artifacts: nuget.artifacts,
         })
     }
+}
+
+fn augment_native_inventory(
+    companion: Option<Vec<u8>>,
+    additional_artifacts: Vec<Value>,
+) -> Result<Option<Vec<u8>>, Error> {
+    let invalid_inventory = || {
+        inputs::incomplete("Could not add verified restore evidence to the native Syft inventory.")
+    };
+    let mut report: Value =
+        serde_json::from_slice(companion.as_deref().ok_or_else(invalid_inventory)?)?;
+    let artifacts = report
+        .get_mut("artifacts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(invalid_inventory)?;
+    artifacts.extend(additional_artifacts);
+    let report = serde_json::to_vec(&report)?;
+    if report.len() as u64 > MAX_COMPANION_BYTES {
+        return Err(inputs::incomplete(
+            "The augmented native inventory exceeds the supported report size.",
+        ));
+    }
+    Ok(Some(report))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScanEvidence {
     pub(crate) scope: ScanScope,
     pub(crate) default_scope: bool,
+    pub(crate) coverage_warnings: Vec<String>,
+    pub(crate) nuget_projects: Vec<super::models::NugetProject>,
     tool: PathBuf,
     exclusions: Vec<String>,
     inputs: std::sync::Arc<inputs::ScanInputs>,
@@ -425,6 +498,8 @@ pub(crate) struct ScanEvidence {
 pub(crate) struct ScanScope {
     configuration: String,
     exclusions: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    coverage_gaps: BTreeSet<String>,
 }
 
 impl ScanScope {
@@ -432,18 +507,35 @@ impl ScanScope {
         serde_json::from_str::<Self>(previous).is_ok_and(|previous| {
             self.configuration == previous.configuration
                 && self.exclusions.is_subset(&previous.exclusions)
+                && self.coverage_gaps.is_subset(&previous.coverage_gaps)
         })
     }
 }
 
 impl ScanEvidence {
+    pub(crate) fn record_coverage_gaps(&mut self, gaps: impl IntoIterator<Item = String>) {
+        for gap in gaps {
+            if self
+                .scope
+                .coverage_gaps
+                .insert(super::hashing::sha256_hex(gap.as_bytes()))
+            {
+                self.coverage_warnings.push(gap);
+            }
+        }
+        self.default_scope &= self.scope.coverage_gaps.is_empty();
+    }
+
     pub(crate) async fn verify_source(&self, root: &Path) -> Result<(), Error> {
         let (config, current) = tokio::join!(
             active_syft_configuration(&self.tool),
             scan_source_inputs(root, &self.tool, &self.exclusions),
         );
         let current_scope = config.as_deref().map(syft_scan_scope).transpose()?;
-        if !current_scope.is_some_and(|(scope, _)| scope == self.scope) || *self.inputs != current?
+        if !current_scope.is_some_and(|(scope, _)| {
+            scope.configuration == self.scope.configuration
+                && scope.exclusions == self.scope.exclusions
+        }) || *self.inputs != current?
         {
             return Err(inputs::incomplete(
                 "Dependency inputs or Syft settings changed during the scan. Retry the scan.",
@@ -477,6 +569,7 @@ fn syft_scan_scope(config: &[u8]) -> Result<(ScanScope, Vec<String>), Error> {
             .iter()
             .map(|pattern| super::hashing::sha256_hex(pattern.as_bytes()))
             .collect(),
+        coverage_gaps: BTreeSet::new(),
     };
     Ok((scope, exclusions))
 }
@@ -532,13 +625,20 @@ async fn inventory_repository(
         .transpose()?
         .is_some_and(|(defaults, _)| scope == defaults);
     let inputs = scan_source_inputs(path, tool, &exclusions).await?;
-    let evidence = ScanEvidence {
+    let mut evidence = ScanEvidence {
         default_scope,
         scope,
+        coverage_warnings: Vec::new(),
+        nuget_projects: Vec::new(),
         tool: tool.to_path_buf(),
         exclusions,
         inputs: std::sync::Arc::new(inputs),
     };
+    if !evidence.exclusions.is_empty() {
+        evidence.record_coverage_gaps([
+            "The active Syft configuration excludes files from this scan.".into(),
+        ]);
+    }
     let directory = grype_cache
         .and_then(Path::parent)
         .and_then(Path::parent)
@@ -639,18 +739,19 @@ async fn capture_syft_outputs_with_tool(
     let legacy_output =
         super::process::output(legacy, None, command_timeout, MAX_COMPANION_BYTES as usize).await?;
     if !legacy_output.status.success() {
-        return Err(Error::Scanner(format!(
-            "syft failed for {}: {}",
-            path.display(),
-            String::from_utf8_lossy(&legacy_output.stderr).trim()
-        )));
+        return Err(command_failed("syft repository scan", legacy_output.status));
     }
     Ok((legacy_output.stdout, None))
 }
 
 fn syft_scan_command(path: &Path, tool: &Path, exclusions: Option<&[String]>) -> AsyncCommand {
     let mut command = syft_command_for_path(tool);
-    command.arg(path).arg("--base-path").arg(path);
+    command
+        .arg(path)
+        .arg("--base-path")
+        .arg(path)
+        .env("SYFT_JAVASCRIPT_INCLUDE_DEV_DEPENDENCIES", "true")
+        .env("SYFT_GOLANG_CAPTURE_SYMBOLS", "all");
     // Freeze the loaded exclusions for both the catalog and file list.
     if let Some(exclusions) = exclusions {
         if exclusions.is_empty() {
@@ -1173,34 +1274,40 @@ fn correlate_remediation_evidence(
     for artifact in artifacts {
         if let Some(purl) = artifact.package_url.as_deref() {
             by_purl.entry(purl).or_default().push(artifact);
+        } else {
+            by_coordinate
+                .entry((
+                    artifact.name.as_str(),
+                    artifact.version.as_deref(),
+                    artifact.package_type.as_deref(),
+                ))
+                .or_insert_with(Vec::new)
+                .push(artifact);
         }
-        by_coordinate
-            .entry((
-                artifact.name.as_str(),
-                artifact.version.as_deref(),
-                artifact.package_type.as_deref(),
-            ))
-            .or_insert_with(Vec::new)
-            .push(artifact);
     }
     findings
         .iter()
         .map(|finding| {
-            let candidates = finding
-                .package_url
-                .as_deref()
-                .and_then(|purl| by_purl.get(purl))
-                .or_else(|| {
-                    by_coordinate.get(&(
-                        finding.package_name.as_str(),
-                        finding.package_version.as_deref(),
-                        finding.package_type.as_deref(),
-                    ))
-                });
-            let candidates = candidates.map(Vec::as_slice).unwrap_or_default();
-            let matched = (candidates.len() == 1)
-                .then(|| candidates.first().copied())
-                .flatten();
+            let coordinate = (
+                finding.package_name.as_str(),
+                finding.package_version.as_deref(),
+                finding.package_type.as_deref(),
+            );
+            let mut candidates = match finding.package_url.as_deref() {
+                Some(purl) => by_purl.get(purl),
+                None => by_coordinate.get(&coordinate),
+            }
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|artifact| {
+                (
+                    artifact.name.as_str(),
+                    artifact.version.as_deref(),
+                    artifact.package_type.as_deref(),
+                ) == coordinate
+            });
+            let matched = candidates.next().filter(|_| candidates.next().is_none());
             evidence_for_finding(finding, matched)
         })
         .collect()
@@ -1315,123 +1422,15 @@ pub fn update_grype_db(grype_db_cache_dir: &Path) -> Result<(), Error> {
     let output = super::process::output_sync(&mut command, Duration::from_secs(120), 1024 * 1024)?;
 
     if !output.status.success() {
-        return Err(command_failed("grype db update", &output));
+        return Err(command_failed("grype db update", output.status));
     }
 
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GrypeReport {
-    matches: Vec<GrypeMatch>,
-    ignored_matches: Option<Vec<GrypeMatch>>,
-}
-
-#[derive(Deserialize)]
-struct GrypeMatch {
-    vulnerability: GrypeVulnerability,
-    artifact: GrypeArtifact,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GrypeVulnerability {
-    id: String,
-    severity: String,
-    description: Option<String>,
-    data_source: Option<String>,
-    fix: Option<GrypeFix>,
-}
-
-#[derive(Deserialize)]
-struct GrypeFix {
-    versions: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-struct GrypeArtifact {
-    name: String,
-    version: Option<String>,
-    #[serde(rename = "type")]
-    package_type: Option<String>,
-    purl: Option<String>,
-}
-
-impl GrypeMatch {
-    fn into_finding(self) -> Result<Option<NormalizedFinding>, Error> {
-        let Self {
-            vulnerability,
-            artifact,
-        } = self;
-        if vulnerability.id.trim().is_empty() || artifact.name.trim().is_empty() {
-            return Err(Error::Scanner(
-                "Grype match is missing its advisory or package identity".into(),
-            ));
-        }
-        let reported_severity = vulnerability.severity.trim();
-        let Some(severity) = Severity::parse(reported_severity) else {
-            if ["low", "negligible", "unknown"]
-                .iter()
-                .any(|value| reported_severity.eq_ignore_ascii_case(value))
-            {
-                return Ok(None);
-            }
-            return Err(Error::Scanner(
-                "Grype match has an unrecognized severity".into(),
-            ));
-        };
-        let fingerprint = build_fingerprint(
-            &vulnerability.id,
-            artifact.package_type.as_deref(),
-            artifact.purl.as_deref(),
-            &artifact.name,
-            artifact.version.as_deref(),
-        );
-        Ok(Some(NormalizedFinding {
-            fingerprint,
-            advisory_id: vulnerability.id,
-            package_name: artifact.name,
-            package_version: artifact.version,
-            package_type: artifact.package_type,
-            severity,
-            fix_version: vulnerability
-                .fix
-                .and_then(|fix| fix.versions)
-                .and_then(|versions| versions.into_iter().next()),
-            title: vulnerability.description,
-            source_url: vulnerability.data_source,
-            package_url: artifact.purl,
-            advisory_details: None,
-        }))
-    }
-}
-
+#[cfg(test)]
 fn parse_grype_json(bytes: &[u8]) -> Result<Vec<NormalizedFinding>, Error> {
-    let report: GrypeReport = serde_json::from_slice(bytes).map_err(|cause| {
-        Error::Scanner(format!("Grype returned an invalid JSON report: {cause}"))
-    })?;
-    let mut findings = BTreeMap::new();
-    for entry in report.matches {
-        if let Some(finding) = entry.into_finding()? {
-            findings
-                .entry(finding.fingerprint.clone())
-                .or_insert(finding);
-        }
-    }
-    for entry in report.ignored_matches.into_iter().flatten() {
-        if let Some(finding) = entry.into_finding()? {
-            if !findings
-                .get(&finding.fingerprint)
-                .is_some_and(|included| included.severity == finding.severity)
-            {
-                return Err(Error::Scanner(
-                    "Grype filters suppressed findings tracked by CVEC. Review Grype's ignore, fix-state, or VEX settings and retry the scan.".into(),
-                ));
-            }
-        }
-    }
-    Ok(findings.into_values().collect())
+    grype_report::parse(bytes, None)
 }
 
 fn parse_cyclonedx_inventory(
@@ -1441,12 +1440,13 @@ fn parse_cyclonedx_inventory(
         Vec<RepoPackage>,
         npm_coverage::NpmCoverage,
         inputs::PythonCoverage,
+        nuget_coverage::NugetCoverage,
+        inputs::CatalogedVersions,
     ),
     Error,
 > {
-    let value: Value = serde_json::from_slice(bytes).map_err(|cause| {
-        Error::Scanner(format!("Syft returned invalid CycloneDX JSON: {cause}"))
-    })?;
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| invalid_report("Syft CycloneDX", &error))?;
     let invalid_inventory =
         || Error::Scanner("Syft output is not a complete CycloneDX inventory".into());
     if value.get("bomFormat").and_then(Value::as_str) != Some("CycloneDX")
@@ -1476,6 +1476,8 @@ fn parse_cyclonedx_inventory(
     let mut packages = BTreeMap::new();
     let mut npm_coverage = npm_coverage::NpmCoverage::default();
     let mut python_coverage = inputs::PythonCoverage::default();
+    let mut nuget_coverage = nuget_coverage::NugetCoverage::default();
+    let mut cargo_coverage = inputs::CatalogedVersions::default();
     for component in components {
         let component_type = component
             .get("type")
@@ -1487,7 +1489,7 @@ fn parse_cyclonedx_inventory(
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(invalid_inventory)?;
-        if !matches!(component_type, "library" | "framework") {
+        if component_type == "file" {
             continue;
         }
         let version = component
@@ -1509,9 +1511,18 @@ fn parse_cyclonedx_inventory(
                     .and_then(Value::as_array)
                     .and_then(|properties| package_type_from_properties(properties))
             });
+        if !matches!(component_type, "library" | "framework") && package_type.is_none() {
+            continue;
+        }
         match (package_type.as_deref(), version.as_deref()) {
             (Some("npm"), Some(version)) => npm_coverage.record(name, version, component),
-            (Some("pypi" | "python"), Some(_)) => python_coverage.record(name, component),
+            (Some("pypi" | "python"), Some(version)) => {
+                python_coverage.record(name, version, component)
+            }
+            (Some("cargo"), Some(version)) => cargo_coverage.record(name, version, component),
+            (Some("nuget" | "dotnet"), Some(version)) => {
+                nuget_coverage.record(name, version, component)
+            }
             _ => {}
         }
 
@@ -1536,6 +1547,8 @@ fn parse_cyclonedx_inventory(
         packages.into_values().collect(),
         npm_coverage,
         python_coverage,
+        nuget_coverage,
+        cargo_coverage,
     ))
 }
 
@@ -1601,11 +1614,7 @@ fn version_for(tool: &str) -> Result<String, Error> {
 
 fn checked_version(tool: &str, output: Output) -> Result<String, Error> {
     if !output.status.success() {
-        return Err(Error::Scanner(format!(
-            "{} --version failed: {}",
-            tool,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+        return Err(command_failed(&format!("{tool} --version"), output.status));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -1760,25 +1769,22 @@ fn parse_json_output<T: for<'de> Deserialize<'de>>(
     output: &Output,
 ) -> Result<T, Error> {
     if output.stdout.is_empty() {
-        return Err(command_failed(command_name, output));
+        return Err(command_failed(command_name, output.status));
     }
 
-    serde_json::from_slice(&output.stdout).map_err(Error::from)
+    serde_json::from_slice(&output.stdout).map_err(|error| invalid_report(command_name, &error))
 }
 
-fn command_failed(command_name: &str, output: &Output) -> Error {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+fn command_failed(command_name: &str, status: ExitStatus) -> Error {
+    Error::Scanner(format!("{command_name} failed ({status})."))
+}
 
-    let details = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        format!("exit status {}", output.status)
-    };
-
-    Error::Scanner(format!("{command_name} failed: {details}"))
+fn invalid_report(source: &str, error: &serde_json::Error) -> Error {
+    Error::Scanner(format!(
+        "Invalid {source} report at line {}, column {}.",
+        error.line(),
+        error.column()
+    ))
 }
 
 fn non_empty(value: String) -> Option<String> {
@@ -1823,6 +1829,7 @@ struct RawGrypeDbVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::models::Severity;
     use std::fs;
 
     #[test]
@@ -1842,13 +1849,30 @@ mod tests {
         ] {
             assert!(parse_grype_json(bytes).is_err());
         }
-        for bytes in [
-            br#"{"matches":[]}"#.as_slice(),
-            br#"{"matches":[{"vulnerability":{"id":"CVE-1","severity":"Low"},"artifact":{"name":"example"}}],"ignoredMatches":null}"#,
-            br#"{"matches":[{"vulnerability":{"id":"CVE-1","severity":"Unknown"},"artifact":{"name":"example"}}]}"#,
-        ] {
-            assert!(parse_grype_json(bytes).unwrap().is_empty());
-        }
+        assert!(parse_grype_json(br#"{"matches":[]}"#).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_scanner_reports_do_not_echo_input_values() {
+        let error = parse_grype_json(br#"{"matches":"private fixture data"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Invalid Grype report at line 1, column"));
+        assert!(!error.contains("private fixture data"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_scanner_commands_only_report_the_operation_and_status() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = Output {
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: b"private stdout fixture".to_vec(),
+            stderr: b"private stderr fixture".to_vec(),
+        };
+        let error = checked_version("syft", output).unwrap_err().to_string();
+        assert_eq!(error, "syft --version failed (exit status: 1).");
     }
 
     #[test]
@@ -1862,10 +1886,10 @@ mod tests {
             "{error}"
         );
 
-        let report = format!(r#"{{"matches":[{critical}],"ignoredMatches":[{critical},{low}]}}"#);
+        let report = format!(r#"{{"matches":[{critical}],"ignoredMatches":[{critical}]}}"#);
         assert_eq!(parse_grype_json(report.as_bytes()).unwrap().len(), 1);
         let report = format!(r#"{{"matches":[],"ignoredMatches":[{low}]}}"#);
-        assert!(parse_grype_json(report.as_bytes()).unwrap().is_empty());
+        assert!(parse_grype_json(report.as_bytes()).is_err());
         assert!(parse_grype_json(br#"{"matches":[],"ignoredMatches":{}}"#).is_err());
     }
 

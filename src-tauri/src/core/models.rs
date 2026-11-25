@@ -40,19 +40,32 @@ impl RepoSourceType {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Severity {
-    #[serde(rename = "MEDIUM")]
+    Unknown,
+    Negligible,
+    Low,
     Medium,
-    #[serde(rename = "HIGH")]
     High,
-    #[serde(rename = "CRITICAL")]
     Critical,
 }
 
 impl Severity {
+    pub const ALL: [Self; 6] = [
+        Self::Critical,
+        Self::High,
+        Self::Medium,
+        Self::Low,
+        Self::Negligible,
+        Self::Unknown,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
+            Severity::Unknown => "UNKNOWN",
+            Severity::Negligible => "NEGLIGIBLE",
+            Severity::Low => "LOW",
             Severity::Medium => "MEDIUM",
             Severity::High => "HIGH",
             Severity::Critical => "CRITICAL",
@@ -60,11 +73,35 @@ impl Severity {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value.to_uppercase().as_str() {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "UNKNOWN" => Some(Self::Unknown),
+            "NEGLIGIBLE" => Some(Self::Negligible),
+            "LOW" => Some(Self::Low),
             "MEDIUM" => Some(Self::Medium),
             "HIGH" => Some(Self::High),
             "CRITICAL" => Some(Self::Critical),
             _ => None,
+        }
+    }
+
+    pub fn rank(self) -> u8 {
+        self as u8 + 1
+    }
+
+    pub fn from_rank(rank: u8) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|severity| severity.rank() == rank)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Critical => "Critical",
+            Self::High => "High",
+            Self::Medium => "Medium",
+            Self::Low => "Low",
+            Self::Negligible => "Negligible",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -109,15 +146,23 @@ pub struct RepoSummary {
     pub new_medium: u32,
     pub new_high: u32,
     pub new_critical: u32,
+    #[serde(default)]
+    pub new_other: u32,
     pub open_medium: u32,
     pub open_high: u32,
     pub open_critical: u32,
+    #[serde(default)]
+    pub open_other: u32,
     pub resolved_medium: u32,
     pub resolved_high: u32,
     pub resolved_critical: u32,
+    #[serde(default)]
+    pub resolved_other: u32,
     pub last_scanned_at: Option<String>,
     pub last_scan_status: Option<ScanRunStatus>,
     pub last_successful_source_revision: Option<String>,
+    #[serde(default)]
+    pub coverage_incomplete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -652,6 +697,8 @@ pub struct RepoFinding {
     pub fix_version: Option<String>,
     pub title: Option<String>,
     pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_evidence: Option<FindingMatchEvidence>,
     pub state: RepoFindingState,
     pub intel: Option<RepoFindingIntel>,
     pub review_state: ReviewState,
@@ -683,18 +730,26 @@ pub struct RepoScanRun {
     pub new_medium: u32,
     pub new_high: u32,
     pub new_critical: u32,
+    #[serde(default)]
+    pub new_other: u32,
     pub resolved_medium: u32,
     pub resolved_high: u32,
     pub resolved_critical: u32,
+    #[serde(default)]
+    pub resolved_other: u32,
     pub source_revision: Option<String>,
     pub source_dirty: Option<bool>,
     pub package_count: Option<u32>,
     pub reopened_count: u32,
     pub warnings: Vec<String>,
     pub evidence_complete: bool,
+    #[serde(default)]
+    pub coverage_warnings: Vec<String>,
     pub open_medium: u32,
     pub open_high: u32,
     pub open_critical: u32,
+    #[serde(default)]
+    pub open_other: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -720,6 +775,26 @@ pub struct RepoOverview {
     pub findings: Vec<RepoFinding>,
     pub scan_history: Vec<RepoScanRun>,
     pub overview: RepoOverviewMetadata,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nuget_projects: Vec<NugetProject>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NugetProject {
+    pub path: String,
+    pub frameworks: Vec<String>,
+    pub declarations: Vec<NugetDeclaration>,
+    pub resolution_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct NugetDeclaration {
+    pub name: String,
+    pub requirement: Option<String>,
+    pub requirement_path: Option<String>,
+    pub conditional: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1080,6 +1155,147 @@ pub struct NormalizedFinding {
     pub source_url: Option<String>,
     pub package_url: Option<String>,
     pub advisory_details: Option<AdvisoryDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_evidence: Option<FindingMatchEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactScanKind {
+    BuildFile,
+    BuildFolder,
+    Sbom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactScanSummary {
+    pub kind: ArtifactScanKind,
+    pub name: String,
+    pub digest: String,
+    pub scanned_at: String,
+    pub platform: Option<String>,
+    pub package_count: usize,
+    pub finding_count: usize,
+    pub coverage_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactScan {
+    pub id: i64,
+    pub repo_id: i64,
+    pub summary: ArtifactScanSummary,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactFindings {
+    pub scan_id: i64,
+    pub repo_id: i64,
+    pub offset: u32,
+    pub findings: Vec<NormalizedFinding>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingMatchKind {
+    Unverified,
+    Cpe,
+    NestedWorkflow,
+    LocalInstallation,
+    GoModule,
+    Upstream,
+    PackageVersion,
+    GoSymbol,
+}
+
+impl FindingMatchKind {
+    pub fn requires_review(self) -> bool {
+        matches!(
+            self,
+            Self::Unverified
+                | Self::Cpe
+                | Self::NestedWorkflow
+                | Self::LocalInstallation
+                | Self::GoModule
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingMatchEvidence {
+    pub kind: FindingMatchKind,
+    pub relative_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled_tool: Option<BundledToolEvidence>,
+}
+
+impl FindingMatchEvidence {
+    pub fn requires_review(&self) -> bool {
+        self.bundled_tool.is_some() || self.kind.requires_review()
+    }
+
+    pub(crate) fn normalize_bundled_go_fix(&mut self, fix_version: &mut Option<String>) -> bool {
+        let newly_classified = self.bundled_tool.is_none();
+        if newly_classified {
+            self.bundled_tool = self
+                .relative_path
+                .as_deref()
+                .and_then(BundledToolEvidence::from_node_modules_path);
+        }
+        let Some(tool) = self.bundled_tool.as_mut() else {
+            return false;
+        };
+        let fix_version = fix_version.take();
+        let changed = newly_classified || fix_version.is_some();
+        if tool.component_fix_version.is_none() {
+            tool.component_fix_version = fix_version;
+        }
+        changed
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BundledToolEvidence {
+    pub package_name: Option<String>,
+    pub component_fix_version: Option<String>,
+}
+
+impl BundledToolEvidence {
+    pub(crate) fn from_node_modules_path(path: &str) -> Option<Self> {
+        let path = path.trim_start_matches('/');
+        if path.contains(['\\', '\0'])
+            || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+        {
+            return None;
+        }
+        let inside = path
+            .rsplit_once("/node_modules/")
+            .map(|(_, inside)| inside)
+            .or_else(|| path.strip_prefix("node_modules/"))?;
+        let package_name = inside.split_once('/').and_then(|(first, rest)| {
+            let valid = |part: &str| {
+                !part.starts_with('.')
+                    && !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            };
+            if let Some(scope) = first.strip_prefix('@') {
+                let (name, _) = rest.split_once('/')?;
+                (valid(scope) && valid(name)).then(|| format!("{first}/{name}"))
+            } else {
+                valid(first).then(|| first.to_owned())
+            }
+        });
+        Some(Self {
+            package_name,
+            component_fix_version: None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1090,9 +1306,13 @@ pub struct DeltaSummary {
     pub new_medium_count: u32,
     pub new_high_count: u32,
     pub new_critical_count: u32,
+    #[serde(default)]
+    pub new_other_count: u32,
     pub resolved_medium_count: u32,
     pub resolved_high_count: u32,
     pub resolved_critical_count: u32,
+    #[serde(default)]
+    pub resolved_other_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1180,9 +1400,13 @@ pub struct OverviewSnapshot {
     pub new_medium: u32,
     pub new_high: u32,
     pub new_critical: u32,
+    #[serde(default)]
+    pub new_other: u32,
     pub open_medium: u32,
     pub open_high: u32,
     pub open_critical: u32,
+    #[serde(default)]
+    pub open_other: u32,
     pub repos_with_new_findings: u32,
     pub last_successful_scan_at: Option<String>,
 }
@@ -1194,6 +1418,8 @@ pub struct RiskTrendPoint {
     pub medium: u32,
     pub high: u32,
     pub critical: u32,
+    #[serde(default)]
+    pub other: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

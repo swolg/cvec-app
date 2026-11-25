@@ -47,8 +47,9 @@ impl NpmCoverage {
         }
     }
 
-    pub(super) fn verify(&self, inputs: &ScanInputs) -> Result<(), Error> {
+    pub(super) fn verify(&self, inputs: &ScanInputs) -> Result<Vec<String>, Error> {
         let pnpm = read_pnpm_resolutions(inputs)?;
+        let mut warnings = Vec::new();
         for manifest_path in inputs.paths().filter(|path| {
             is_project_input(path) && path.file_name().is_some_and(|name| name == "package.json")
         }) {
@@ -66,7 +67,7 @@ impl NpmCoverage {
                 };
                 Some((lock, importer))
             });
-            let missing = runtime_dependencies(&manifest).any(|(name, specification)| {
+            let missing = |name, specification| {
                 let effective = match &resolution {
                     Some((lock, importer)) => {
                         lock.effective_specifier(importer, &manifest, name, specification)
@@ -98,16 +99,32 @@ impl NpmCoverage {
                     && !directory
                         .ancestors()
                         .any(|ancestor| self.packages_by_root.get(ancestor).is_some_and(covers))
-            });
-            if missing {
+            };
+            if required_dependencies(&manifest, "dependencies")
+                .any(|(name, specification)| missing(name, specification))
+            {
                 return Err(inventory_gap(manifest_path));
             }
+            if required_dependencies(&manifest, "devDependencies")
+                .filter(|(name, _)| {
+                    manifest
+                        .get("dependencies")
+                        .and_then(|dependencies| dependencies.get(name))
+                        .is_none()
+                })
+                .any(|(name, specification)| missing(name, specification))
+            {
+                warnings.push(format!(
+                    "Could not verify all JavaScript development dependencies in {}",
+                    manifest_path.display()
+                ));
+            }
         }
-        Ok(())
+        Ok(warnings)
     }
 }
 
-fn resolution_root(path: &str) -> Option<PathBuf> {
+pub(super) fn resolution_root(path: &str) -> Option<PathBuf> {
     // Syft uses slash-prefixed paths relative to the scanned source.
     let path = Path::new(path.trim_start_matches('/'));
     let mut root = PathBuf::new();
@@ -128,14 +145,18 @@ fn resolution_root(path: &str) -> Option<PathBuf> {
             | "yarn.lock"
             | "bun.lock"
             | "bun.lockb"
+            | "deno.lock"
     )
     .then(|| root.parent().unwrap_or_else(|| Path::new("")).to_path_buf())
 }
 
-fn runtime_dependencies(manifest: &Value) -> impl Iterator<Item = (&str, &str)> {
+fn required_dependencies<'a>(
+    manifest: &'a Value,
+    key: &str,
+) -> impl Iterator<Item = (&'a str, &'a str)> {
     // Peer and optional dependencies can be absent from a complete install.
     manifest
-        .get("dependencies")
+        .get(key)
         .and_then(Value::as_object)
         .into_iter()
         .flatten()

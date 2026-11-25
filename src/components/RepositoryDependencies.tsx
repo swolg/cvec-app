@@ -2,6 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Cell, Column, Row, Table, TableBody, TableHeader } from "react-aria-components/Table";
 import * as VirtualizerPrimitives from "react-aria-components/Virtualizer";
 import { listRepositoryDependencies } from "@/lib/api";
+import { severityLabel } from "@/lib/format";
+import { SEVERITIES } from "@/lib/types";
 import type { DependencyPage, DependencyQuery, RepoPackage, ScannedPackageIdentity, Severity } from "@/lib/types";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -216,7 +218,7 @@ export function RepositoryDependencies({ repoId, scanRunId, dependencyRevision, 
       <Button aria-pressed={affectedOnly} variant="toggle" onClick={()=>setAffectedOnly((value)=>!value)}>Affected only</Button>
       <Select containerClassName="min-w-32 flex-1" aria-label="Filter dependency ecosystem" value={ecosystem} onValueChange={setEcosystem}><option value="all">Any ecosystem</option>{ecosystemOptions.map((kind)=><option key={kind} value={kind}>{kind}</option>)}</Select>
       <Select containerClassName="min-w-32 flex-1" aria-label="Filter fix availability" value={fixability} onValueChange={setFixability}><option value="all">Any fix state</option><option value="fixable">Fix available</option><option value="unlisted">No fix listed</option></Select>
-      <Select containerClassName="min-w-32 flex-1" aria-label="Filter dependency severity" value={severity} onValueChange={(value)=>setSeverity(value as Severity|"all")}><option value="all">Any severity</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option></Select>
+      <Select containerClassName="min-w-32 flex-1" aria-label="Filter dependency severity" value={severity} onValueChange={(value)=>setSeverity(value as Severity|"all")}><option value="all">Any severity</option>{SEVERITIES.map((severity) => <option key={severity} value={severity}>{severityLabel(severity)}</option>)}</Select>
       <Select containerClassName="min-w-32 flex-1" aria-label="Sort dependencies" value={sort} onValueChange={setSort}><option value="risk">Risk</option><option value="name">Name</option><option value="ecosystem">Ecosystem</option></Select>
     </div> : null}
     <p role="status" className={exactPackage && !updating ? "sr-only" : "text-xs text-ink-subtle"}>

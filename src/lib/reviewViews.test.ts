@@ -73,7 +73,7 @@ describe("review views", () => {
     const old = createCustomView(defaultReviewViewsState(), "Legacy", BUILT_IN_REVIEW_VIEWS[0].query);
     expect(parseReviewViews({ ...old, version: 0 }).version).toBe(2);
     const invalid = structuredClone(old);
-    invalid.customViews[0].query.filters.severities = ["UNKNOWN" as never];
+    invalid.customViews[0].query.filters.severities = ["UNSUPPORTED" as never];
     expect(() => parseReviewViews(invalid)).toThrow(/severities|invalid option/i);
   });
 

@@ -2,12 +2,24 @@ import { incompleteInventoryReason } from "./format";
 import type {
   RepoOverview,
   RepoScanRun,
+  RepoSourceType,
   RepoSummary,
   RepositoryMonitoringStatus,
   ScheduleInterval,
 } from "./types";
 
 const STALE_GRACE_MS = 15 * 60 * 60 * 1000;
+
+export function formatCoverageWarning(warning: string, sourceType: RepoSourceType): string {
+  // Saved scans use both forms. Preserve their original scope evidence.
+  const missingNuget = /^NuGet dependency coverage for (.+) requires (?:a resolved packages\.lock\.json|packages\.lock\.json or a current project\.assets\.json for this project directory)\.?$/.exec(warning);
+  if (!missingNuget) return warning;
+
+  const action = sourceType === "github"
+    ? "A checked-in NuGet lockfile, a local restore, or a build SBOM can supply resolved versions."
+    : "Run dotnet restore in a local checkout and scan it again.";
+  return `Resolved NuGet versions are unavailable for ${missingNuget[1]}. ${action}`;
+}
 
 export function deriveRepositoryMonitoring(
   repo: RepoSummary,
@@ -52,6 +64,9 @@ export function deriveRepositoryMonitoring(
   }
   if (repo.sourceType === "github" && repo.lastRemoteCommitSha && !(latestScan?.sourceRevision ?? repo.lastSuccessfulSourceRevision)) {
     return { state: "unknown", reason: "The stored scan does not contain comparable source-revision evidence.", lastSuccessfulScanAt, latestAttemptAt };
+  }
+  if (repo.coverageIncomplete || lastSuccessfulScan?.coverageWarnings?.length) {
+    return { state: "coverage_incomplete", reason: "Some dependency inputs could not be verified. See the coverage details for this repository.", lastSuccessfulScanAt, latestAttemptAt };
   }
   if (repo.lastScanStatus === "completed" || latestScan?.status === "completed") {
     return { state: "current", reason: "The latest locally recorded scan completed successfully.", lastSuccessfulScanAt, latestAttemptAt };

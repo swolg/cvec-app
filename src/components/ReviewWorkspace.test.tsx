@@ -270,6 +270,41 @@ describe("ReviewWorkspace", () => {
   });
 
   it.each([
+    { kind: "go_symbol", label: "Bundled tool" },
+    { kind: "go_module", label: "Go version match" },
+  ] as const)("shows the npm tool and offers analysis for $kind evidence", async ({ kind, label }) => {
+    const item: ReviewFinding = {
+      ...finding,
+      finding: {
+        ...finding.finding,
+        packageType: "go-module",
+        fixVersion: null,
+        matchEvidence: {
+          kind,
+          relativePath: "node_modules/@example/cli/lib/tool",
+          bundledTool: { packageName: "@example/cli", componentFixVersion: "1.0.1" },
+        },
+      },
+    };
+    vi.mocked(listReviewFindings).mockResolvedValue(reviewPage([item]));
+    vi.mocked(getReviewFindingDetail).mockResolvedValue(item);
+    const onContinueInChat = vi.fn();
+    render(<ReviewWorkspace viewsState={defaultReviewViewsState()} onViewsStateChange={() => {}} initialViewId="all-open" scannerReady onOpenRepo={() => {}} onOpenUrl={() => {}} onContinueInChat={onContinueInChat} onError={() => {}} />);
+    const row = await screen.findByRole("row", { name: /CVE-2026-1000/ });
+    expect(row).toHaveTextContent(label);
+    fireEvent.click(row);
+    const evidence = within(await screen.findByRole("region", { name: "Scanner match" }));
+    expect(evidence.getByText("@example/cli")).toBeVisible();
+    expect(evidence.getByText("Go module fixed in")).toBeVisible();
+    expect(evidence.getByText("1.0.1")).toBeVisible();
+    const action = screen.getByRole("button", { name: "Analyze in Chat" });
+    expect(action).toHaveAccessibleDescription(/npm tool’s releases/);
+    expect(screen.queryByRole("button", { name: "Fix in Chat" })).not.toBeInTheDocument();
+    fireEvent.click(action);
+    expect(onContinueInChat).toHaveBeenCalledWith(expect.objectContaining({ mode: "analysis", targetVersion: null }));
+  });
+
+  it.each([
     { repoSourceType: "github", state: "open", view: "all-open", heading: "Remediation evidence", reason: /local checkout/ },
     { repoSourceType: "local", state: "resolved", view: "recently-resolved", heading: "Historical evidence", reason: /historical finding/ },
   ] as const)("explains the analysis-only handoff for $repoSourceType $state evidence", async ({ repoSourceType, state, view, heading, reason }) => {
@@ -295,7 +330,7 @@ describe("ReviewWorkspace", () => {
 
   it.each([
     { id: CRITICAL_TO_REVIEW_VIEW, name: "Critical to review", severities: ["CRITICAL"] },
-    { id: OTHER_TO_REVIEW_VIEW, name: "Other findings to review", severities: ["HIGH", "MEDIUM"] },
+    { id: OTHER_TO_REVIEW_VIEW, name: "Other findings to review", severities: ["HIGH", "MEDIUM", "LOW", "NEGLIGIBLE", "UNKNOWN"] },
   ])("opens the dashboard's $name count with the matching query", async ({ id, name, severities }) => {
     render(<ReviewWorkspace viewsState={defaultReviewViewsState()} onViewsStateChange={() => {}} initialContext={{ viewId: id }} scannerReady onOpenRepo={() => {}} onOpenUrl={() => {}} onError={() => {}} />);
     expect(screen.getByRole("button", { name })).toHaveAttribute("aria-current", "true");

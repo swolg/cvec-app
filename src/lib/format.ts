@@ -1,4 +1,8 @@
-import type { ScanAllSummary } from "./types";
+import type { ScanAllSummary, Severity } from "./types";
+
+export function severityLabel(severity: Severity): string {
+  return severity[0] + severity.slice(1).toLowerCase();
+}
 
 export function formatRelativeTimestamp(value: string | null): string {
   if (!value) {

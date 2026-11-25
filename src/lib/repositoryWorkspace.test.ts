@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { emptyRepoOverview, READY_SNAPSHOT } from "@/test/fixtures";
 import type { RepoScanRun } from "./types";
-import { deriveRepositoryMonitoring, RepositoryOverviewCache } from "./repositoryWorkspace";
+import { deriveRepositoryMonitoring, formatCoverageWarning, RepositoryOverviewCache } from "./repositoryWorkspace";
 
 const completed: RepoScanRun = {
   id: 10, status: "completed", startedAt: "2026-08-15T08:00:00Z", finishedAt: "2026-08-15T08:01:00Z",
@@ -11,6 +11,19 @@ const completed: RepoScanRun = {
 };
 
 describe("repository workspace projections", () => {
+  it("explains the optional NuGet lockfile and the local restore alternative for saved scans", () => {
+    const prefix = "NuGet dependency coverage for src/Example.csproj requires ";
+    const original = `${prefix}a resolved packages.lock.json`;
+    const current = `${prefix}packages.lock.json or a current project.assets.json for this project directory.`;
+
+    const github = formatCoverageWarning(current, "github");
+    expect(github).toContain("Resolved NuGet versions are unavailable for src/Example.csproj.");
+    expect(github).toContain("a local restore, or a build SBOM");
+    expect(formatCoverageWarning(original, "github")).toBe(github);
+    expect(formatCoverageWarning(current, "local")).toContain("Run dotnet restore in a local checkout");
+    expect(formatCoverageWarning("Could not read package metadata.", "github")).toBe("Could not read package metadata.");
+  });
+
   it("uses strict monitoring precedence and explains missing revision evidence", () => {
     const repo = { ...READY_SNAPSHOT.repos[0], lastScanStatus: "completed" as const, lastScannedAt: completed.finishedAt };
     expect(deriveRepositoryMonitoring({ ...repo, status: "scanning" }, { ...completed, status: "running" }, "off").state).toBe("scanning");

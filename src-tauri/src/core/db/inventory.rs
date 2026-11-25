@@ -16,7 +16,7 @@ const INVENTORY_RISKS: &str = r#"
 , risks AS MATERIALIZED (
  SELECT COALESCE(package_url,cvec_package_identity(NULL,package_name,package_version,package_type)) identity,
    package_name name,package_version version,package_type,package_url,
-   COUNT(*) finding_count,MAX(CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'HIGH' THEN 2 ELSE 1 END) severity_rank,
+   COUNT(*) finding_count,MAX(cvec_severity_rank(severity)) severity_rank,
    MAX(fix_version IS NOT NULL) fix_available
  FROM vulnerabilities WHERE repo_id=?1 AND scan_run_id=(SELECT id FROM latest) GROUP BY identity
 )
@@ -72,6 +72,9 @@ pub(crate) struct ChatFindingCounts {
     pub critical: u32,
     pub high: u32,
     pub medium: u32,
+    pub low: u32,
+    pub negligible: u32,
+    pub unknown: u32,
     pub resolved: u32,
 }
 
@@ -110,8 +113,8 @@ const CHAT_COMPLETED_RUNS: &str = "SELECT id FROM scan_runs
     WHERE repo_id=?1 AND status='completed' ORDER BY started_at DESC,id DESC";
 const CHAT_LATEST_RUN: &str = "ORDER BY started_at DESC,id DESC LIMIT 1";
 const CHAT_SCAN: &str = "SELECT id,status,started_at,finished_at,source_revision,source_dirty,
-    package_count,evidence_complete,new_medium_count+new_high_count+new_critical_count,
-    resolved_medium_count+resolved_high_count+resolved_critical_count FROM scan_runs";
+    package_count,evidence_complete,new_medium_count+new_high_count+new_critical_count+new_other_count,
+    resolved_medium_count+resolved_high_count+resolved_critical_count+resolved_other_count FROM scan_runs";
 const CHAT_FINDING_RUNS: &str = r#"
     WITH recent AS MATERIALIZED (
         SELECT id,started_at FROM scan_runs WHERE repo_id=?1 AND status='completed'
@@ -124,7 +127,7 @@ const CHAT_FINDING_RUNS: &str = r#"
 const CHAT_FINDING_COLUMNS: &str =
     "v.fingerprint,v.advisory_id,v.package_name,v.package_version,v.package_type,
      v.package_url,v.severity,v.fix_version,v.title,v.source_url,v.advisory_details_json,
-     fr.state,fr.reviewed_at,fr.snooze_until,fr.note";
+     fr.state,fr.reviewed_at,fr.snooze_until,fr.note,v.match_evidence_json";
 const CHAT_FINDING_STATE: &str = r#"
     CASE WHEN v.scan_run_id=r.previous_id THEN 'resolved'
          WHEN NOT (EXISTS(SELECT 1 FROM scan_runs p WHERE p.id=r.previous_id AND p.evidence_complete=1)
@@ -261,7 +264,7 @@ impl ChatEvidenceReader<'_> {
                          json_extract(v.advisory_details_json,'$.url'))=?2
               ELSE 0 END
             ORDER BY (v.scan_run_id=r.latest_id) DESC,
-                     CASE upper(v.severity) WHEN 'CRITICAL' THEN 3 WHEN 'MEDIUM' THEN 1 ELSE 2 END DESC,
+                     cvec_severity_rank(v.severity) DESC,
                      v.package_name,v.advisory_id,v.fingerprint
             "#,
             detected = scan_has_finding("current", "r.latest_id", "v"),
@@ -291,9 +294,8 @@ impl ChatEvidenceReader<'_> {
                 WHERE v.repo_id=?1 AND v.scan_run_id=r.latest_id AND ?4>0
                 ORDER BY cvec_chat_relevance(v.advisory_id||' '||v.package_name||' '||
                            v.fingerprint||' '||COALESCE(v.title,'')||' '||
-                           CASE upper(v.severity) WHEN 'CRITICAL' THEN 'CRITICAL'
-                               WHEN 'MEDIUM' THEN 'MEDIUM' ELSE 'HIGH' END,?3) DESC,
-                         CASE upper(v.severity) WHEN 'CRITICAL' THEN 3 WHEN 'MEDIUM' THEN 1 ELSE 2 END DESC,
+                           v.severity,?3) DESC,
+                         cvec_severity_rank(v.severity) DESC,
                          v.fingerprint
                 LIMIT ?4
             ), exact AS (
@@ -350,7 +352,8 @@ impl ChatEvidenceReader<'_> {
         let rows =
             statement.query_map(params![self.repository.id, needle, limit as i64], |row| {
                 let version: Option<String> = row.get(3)?;
-                let severity = Severity::parse(row.get_ref(4)?.as_str()?).unwrap_or(Severity::High);
+                let severity =
+                    Severity::parse(row.get_ref(4)?.as_str()?).unwrap_or(Severity::Unknown);
                 Ok(CompanionMention {
                     id: row.get(0)?,
                     kind: ContextAttachmentKind::Finding,
@@ -473,26 +476,34 @@ impl ChatEvidenceReader<'_> {
         let repo_id = self.repository.id;
         let mut counts = self.connection.query_row(
             "SELECT COUNT(*), COUNT(*) FILTER (WHERE severity='CRITICAL' COLLATE NOCASE),
-                    COUNT(*) FILTER (WHERE severity='MEDIUM' COLLATE NOCASE)
+                    COUNT(*) FILTER (WHERE severity='HIGH' COLLATE NOCASE),
+                    COUNT(*) FILTER (WHERE severity='MEDIUM' COLLATE NOCASE),
+                    COUNT(*) FILTER (WHERE severity='LOW' COLLATE NOCASE),
+                    COUNT(*) FILTER (WHERE severity='NEGLIGIBLE' COLLATE NOCASE)
              FROM vulnerabilities WHERE repo_id=?1 AND scan_run_id=?2",
             params![repo_id, scan_id],
             |row| {
                 let total_open = row.get::<_, u32>(0)?;
                 let critical = row.get::<_, u32>(1)?;
-                let medium = row.get::<_, u32>(2)?;
+                let high = row.get::<_, u32>(2)?;
+                let medium = row.get::<_, u32>(3)?;
+                let low = row.get::<_, u32>(4)?;
+                let negligible = row.get::<_, u32>(5)?;
                 Ok(ChatFindingCounts {
                     total_open,
                     critical,
                     medium,
-                    // Match Severity::parse's fallback for older scan records.
-                    high: total_open - critical - medium,
+                    high,
+                    low,
+                    negligible,
+                    unknown: total_open - critical - high - medium - low - negligible,
                     resolved: 0,
                 })
             },
         )?;
-        let (medium, high, critical) =
+        let (medium, high, critical, other) =
             Database::scan_resolution_counts(self.connection, previous_id, scan_id)?;
-        counts.resolved = medium + high + critical;
+        counts.resolved = medium + high + critical + other;
         Ok(counts)
     }
 }
@@ -513,7 +524,7 @@ fn chat_scan_from_row(row: &Row<'_>) -> rusqlite::Result<ChatScan> {
 }
 
 fn chat_finding_from_row(row: &Row<'_>) -> rusqlite::Result<RepoFinding> {
-    let state = row.get_ref(15)?.as_str()?;
+    let state = row.get_ref(16)?.as_str()?;
     let advisory = match row.get_ref(10)? {
         rusqlite::types::ValueRef::Text(bytes) => {
             serde_json::from_slice::<AdvisoryDetails>(bytes).ok()
@@ -527,10 +538,13 @@ fn chat_finding_from_row(row: &Row<'_>) -> rusqlite::Result<RepoFinding> {
         package_version: row.get(3)?,
         package_type: row.get(4)?,
         package_url: row.get(5)?,
-        severity: Severity::parse(row.get_ref(6)?.as_str()?).unwrap_or(Severity::High),
+        severity: Severity::parse(row.get_ref(6)?.as_str()?).unwrap_or(Severity::Unknown),
         fix_version: row.get(7)?,
         title: row.get(8)?,
         source_url: row.get(9)?,
+        match_evidence: row
+            .get::<_, Option<String>>(15)?
+            .and_then(|value| serde_json::from_str(&value).ok()),
         state: match state {
             "resolved" => RepoFindingState::Resolved,
             "new" => RepoFindingState::New,
@@ -556,12 +570,7 @@ fn package_from_row(row: &Row<'_>, start: usize) -> rusqlite::Result<RepoPackage
         version: row.get(start + 1)?,
         package_type: row.get(start + 2)?,
         package_url: row.get(start + 3)?,
-        highest_severity: match row.get::<_, u8>(start + 4)? {
-            3 => Some(Severity::Critical),
-            2 => Some(Severity::High),
-            1 => Some(Severity::Medium),
-            _ => None,
-        },
+        highest_severity: Severity::from_rank(row.get(start + 4)?),
         finding_count: row.get(start + 5)?,
         fix_available: row.get(start + 6)?,
     })
@@ -727,7 +736,14 @@ impl Database {
             opportunities: Vec::new(),
         };
         let mut findings = Vec::new();
+        let mut nuget_projects = Vec::new();
         if let Some(scan) = metadata.latest_completed_scan.as_ref() {
+            let projects: String = tx.query_row(
+                "SELECT nuget_projects_json FROM scan_runs WHERE repo_id = ?1 AND id = ?2",
+                params![repo_id, scan.id],
+                |row| row.get(0),
+            )?;
+            nuget_projects = serde_json::from_str(&projects)?;
             (
                 metadata.package_count,
                 metadata.affected_count,
@@ -752,6 +768,7 @@ impl Database {
             findings,
             scan_history,
             overview: metadata,
+            nuget_projects,
         })
     }
     pub fn dependency_page(

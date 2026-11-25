@@ -1,4 +1,8 @@
+import { FINDING_MATCH_LABEL } from "./findingMatch";
+import { isSeverity } from "./types";
 import type {
+  ArtifactFindings,
+  ArtifactScan,
   CompanionAccountStatus,
   CompanionCachedThreadSnapshot,
   CompanionConversationIndex,
@@ -100,7 +104,22 @@ export function parseReviewFinding(value: unknown): ReviewFinding {
   const item = object(value, "Review finding");
   const finding = object(item.finding, "Review finding");
   if (typeof item.repoId !== "number" || typeof item.repoName !== "string" || typeof finding.fingerprint !== "string" || typeof finding.advisoryId !== "string" || !["unreviewed", "reviewed", "snoozed"].includes(String(item.reviewState)) || !Array.isArray(item.priorityReasons)) throw new Error("Malformed Review finding payload");
+  validateFindingMatchEvidence(finding.matchEvidence);
   return value as ReviewFinding;
+}
+
+function validateFindingMatchEvidence(value: unknown): void {
+  if (value === undefined) return;
+  const evidence = object(value, "finding match evidence");
+  if (typeof evidence.kind !== "string" || !Object.hasOwn(FINDING_MATCH_LABEL, evidence.kind)) {
+    throw new Error("Malformed finding match evidence");
+  }
+  stringOrNull(evidence.relativePath, "finding match location");
+  if (evidence.bundledTool !== undefined) {
+    const tool = object(evidence.bundledTool, "bundled tool evidence");
+    stringOrNull(tool.packageName, "bundled tool package name");
+    stringOrNull(tool.componentFixVersion, "bundled component fix version");
+  }
 }
 
 export function parseRepoAssets(value: unknown, repoId: number): RepoAsset[] {
@@ -117,6 +136,39 @@ export function parseRepoAssets(value: unknown, repoId: number): RepoAsset[] {
     stringOrNull(asset.version, "repository product signal version");
   }
   return value as RepoAsset[];
+}
+
+export function parseArtifactScan(value: unknown, repoId: number): ArtifactScan {
+  const scan = object(value, "artifact scan");
+  const summary = object(scan.summary, "artifact scan summary");
+  if (scan.repoId !== repoId || !isNonNegativeInteger(scan.id) || scan.id === 0 ||
+    !["build_file", "build_folder", "sbom"].includes(String(summary.kind)) ||
+    typeof summary.name !== "string" || typeof summary.scannedAt !== "string" ||
+    typeof summary.digest !== "string" || !/^[a-f0-9]{64}$/.test(summary.digest) ||
+    !isNonNegativeInteger(summary.packageCount) || !isNonNegativeInteger(summary.findingCount) ||
+    !Array.isArray(summary.coverageWarnings) || !summary.coverageWarnings.every((warning) => typeof warning === "string")) {
+    throw new Error("Malformed artifact scan payload");
+  }
+  stringOrNull(summary.platform, "artifact scan platform");
+  return value as ArtifactScan;
+}
+
+export function parseArtifactFindings(value: unknown, repoId: number, scanId: number, offset: number): ArtifactFindings {
+  const page = object(value, "artifact findings");
+  if (page.repoId !== repoId || page.scanId !== scanId || page.offset !== offset || !Array.isArray(page.findings)) {
+    throw new Error("Malformed artifact findings payload");
+  }
+  for (const raw of page.findings) {
+    const finding = object(raw, "artifact finding");
+    if (typeof finding.fingerprint !== "string" || typeof finding.advisoryId !== "string" || typeof finding.packageName !== "string" || !isSeverity(finding.severity)) {
+      throw new Error("Malformed artifact finding payload");
+    }
+    for (const key of ["packageVersion", "packageType", "fixVersion", "title", "sourceUrl"] as const) {
+      stringOrNull(finding[key], "artifact finding");
+    }
+    validateFindingMatchEvidence(finding.matchEvidence);
+  }
+  return value as ArtifactFindings;
 }
 
 export function parseRepoOverview(value: unknown): RepoOverview {
@@ -154,14 +206,34 @@ export function parseRepoOverview(value: unknown): RepoOverview {
   }
   for (const value of detail.findings) {
     const finding = object(value, "Repository finding");
-    if (typeof finding.fingerprint !== "string" || typeof finding.advisoryId !== "string" || typeof finding.packageName !== "string" || !["MEDIUM", "HIGH", "CRITICAL"].includes(String(finding.severity)) || !["new", "open"].includes(String(finding.state))) {
+    if (typeof finding.fingerprint !== "string" || typeof finding.advisoryId !== "string" || typeof finding.packageName !== "string" || !isSeverity(finding.severity) || !["new", "open"].includes(String(finding.state))) {
       throw new Error("Malformed Repository finding payload");
     }
+    validateFindingMatchEvidence(finding.matchEvidence);
   }
   for (const key of ["latestScan", "previousScan"] as const) {
     if (detail[key] !== null) parseRepoScan(detail[key]);
   }
   for (const scan of detail.scanHistory) parseRepoScan(scan);
+  if (detail.nugetProjects !== undefined) {
+    if (!Array.isArray(detail.nugetProjects)) throw new Error("Malformed .NET projects payload");
+    for (const raw of detail.nugetProjects) {
+      const project = object(raw, ".NET project");
+      if (typeof project.path !== "string" || !Array.isArray(project.frameworks) ||
+        !project.frameworks.every((framework) => typeof framework === "string") || !Array.isArray(project.declarations)) {
+        throw new Error("Malformed .NET project payload");
+      }
+      stringOrNull(project.resolutionPath, "NuGet resolution path");
+      for (const item of project.declarations) {
+        const declaration = object(item, "NuGet declaration");
+        if (typeof declaration.name !== "string" || typeof declaration.conditional !== "boolean") {
+          throw new Error("Malformed NuGet declaration payload");
+        }
+        stringOrNull(declaration.requirement, "NuGet version requirement");
+        stringOrNull(declaration.requirementPath, "NuGet version requirement path");
+      }
+    }
+  }
   return value as RepoOverview;
 }
 
@@ -180,7 +252,7 @@ export function parseDependencyPage(value: unknown): DependencyPage {
   for (const value of page.items) {
     const pkg = object(value, "Repository package");
     if (typeof pkg.name !== "string" || !isNonNegativeInteger(pkg.findingCount) || typeof pkg.fixAvailable !== "boolean" ||
-      (pkg.highestSeverity !== null && !["MEDIUM", "HIGH", "CRITICAL"].includes(String(pkg.highestSeverity)))) {
+      (pkg.highestSeverity !== null && !isSeverity(pkg.highestSeverity))) {
       throw new Error("Malformed Repository package payload");
     }
     for (const key of ["version", "packageType", "packageUrl"] as const) stringOrNull(pkg[key], "Repository package");
@@ -215,11 +287,14 @@ function parseRepoScan(value: unknown): void {
   if (scan.packageCount !== undefined && scan.packageCount !== null && !isNonNegativeInteger(scan.packageCount)) {
     throw new Error("Malformed Repository scan payload");
   }
-  for (const key of ["reopenedCount", "openMedium", "openHigh", "openCritical"] as const) {
+  for (const key of ["reopenedCount", "openMedium", "openHigh", "openCritical", "openOther", "newOther", "resolvedOther"] as const) {
     if (scan[key] !== undefined && !isNonNegativeInteger(scan[key])) throw new Error("Malformed Repository scan payload");
   }
   if (scan.evidenceComplete !== undefined && typeof scan.evidenceComplete !== "boolean") throw new Error("Malformed Repository scan payload");
   if (scan.warnings !== undefined && (!Array.isArray(scan.warnings) || !scan.warnings.every((warning) => typeof warning === "string"))) {
+    throw new Error("Malformed Repository scan payload");
+  }
+  if (scan.coverageWarnings !== undefined && (!Array.isArray(scan.coverageWarnings) || !scan.coverageWarnings.every((warning) => typeof warning === "string"))) {
     throw new Error("Malformed Repository scan payload");
   }
 }

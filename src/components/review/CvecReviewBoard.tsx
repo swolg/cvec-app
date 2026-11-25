@@ -8,6 +8,7 @@ import { CaretDown, CaretRight, CheckCircle, DotsSixVertical, DotsThree, GitBran
 
 import { formatRelativeTimestamp } from "@/lib/format";
 import { findingDisplayTitle, projectReviewLanes, reorderLanes, reviewFindingKey, type ReviewLane } from "@/lib/reviewProjection";
+import { findingMatchReviewLabel } from "@/lib/findingMatch";
 import type { ReviewPresentation } from "@/lib/reviewViews";
 import type { ReviewFinding, ReviewGroupCounts, ReviewState } from "@/lib/types";
 import { AppIcon } from "@/components/ui/app-icon";
@@ -591,10 +592,14 @@ function ReviewCardPreview({ item, layout, magnetized }: { item: ReviewFinding; 
 
 function ReviewCardContent({ item, layout, actions }: { item: ReviewFinding; layout: ReviewCardLayout; actions?: ReactNode }) {
   const severity = item.finding.severity;
+  const matchLabel = findingMatchReviewLabel(item.finding.matchEvidence);
   return (
     <>
       <div className="flex h-8 shrink-0 items-center justify-between gap-1">
-        <Badge variant={severity === "CRITICAL" ? "destructive" : severity === "HIGH" ? "warning" : "secondary"}>{severity}</Badge>
+        <div className="flex min-w-0 items-center gap-1">
+          <Badge variant={severity === "CRITICAL" ? "destructive" : severity === "HIGH" ? "warning" : "secondary"}>{severity}</Badge>
+          {matchLabel ? <Badge variant="outline">{matchLabel}</Badge> : null}
+        </div>
         {actions}
       </div>
       <CardFinding item={item} density={layout.density} showRepository={layout.showRepository} />

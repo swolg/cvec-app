@@ -30,7 +30,7 @@ interface RiskTrendChartProps {
 
 type TrendResult = { revision: number; day: string; data: RiskTrendPoint[] | null };
 const EMPTY_TREND: RiskTrendPoint[] = [];
-type SeriesKey = "critical" | "high" | "medium";
+type SeriesKey = "critical" | "high" | "medium" | "other";
 
 interface SeriesConfig {
   key: SeriesKey;
@@ -58,6 +58,7 @@ const SERIES: readonly SeriesConfig[] = [
     color: "var(--status-medium)",
     softColor: "var(--status-medium-soft)",
   },
+  { key: "other", label: "Other severities", color: "var(--ink-subtle)", softColor: "var(--surface-3)" },
 ];
 
 const RANGES: readonly RiskTrendRange[] = [7, 14, 30];
@@ -96,13 +97,14 @@ export function RiskTrendChart({
     return () => { active = false; };
   }, [hasCompletedScan, inventoryRevision, day, attempt, read]);
 
+  const seriesWithData = SERIES.filter(({ key }) => key !== "other" || data.some((point) => (point.other ?? 0) > 0));
   const maxValue = Math.max(
     1,
-    ...data.flatMap((point) => [point.critical, point.high, point.medium]),
+    ...data.flatMap((point) => [point.critical, point.high, point.medium, point.other ?? 0]),
   );
   const roundedMax = Math.max(1, Math.ceil(maxValue / 5) * 5);
   const hasData = data.some(
-    (point) => point.critical > 0 || point.high > 0 || point.medium > 0,
+    (point) => point.critical > 0 || point.high > 0 || point.medium > 0 || (point.other ?? 0) > 0,
   );
   const latest = data[data.length - 1] ?? null;
   const [contentRef, mode] = useWidgetContentMode<HTMLDivElement>();
@@ -152,7 +154,7 @@ export function RiskTrendChart({
             isCompact ? "mb-2 gap-x-3 gap-y-1.5" : "mb-3 gap-x-4 gap-y-2"
           }`}
         >
-          {SERIES.map((series) => (
+          {seriesWithData.map((series) => (
             <div
               className={`flex min-w-0 items-center gap-2 ${isCompact ? "text-xs" : "text-xs"}`}
               key={series.key}
@@ -163,7 +165,7 @@ export function RiskTrendChart({
               />
               <span className="text-ink-subtle">{series.label}</span>
               <span className="font-semibold text-ink">
-                {latest ? latest[series.key] : "—"}
+                {latest ? (latest[series.key] ?? 0) : "—"}
               </span>
             </div>
           ))}
@@ -214,7 +216,7 @@ export function RiskTrendChart({
               );
             })}
 
-            {SERIES.slice()
+            {seriesWithData.slice()
               .reverse()
               .map((series) => (
                 <path
@@ -225,7 +227,7 @@ export function RiskTrendChart({
                 />
               ))}
 
-            {SERIES.map((series) => (
+            {seriesWithData.map((series) => (
               <path
                 d={buildLinePath(data, series.key, roundedMax)}
                 fill="none"
@@ -311,7 +313,7 @@ function buildLinePath(
   return data
     .map((point, index) => {
       const command = index === 0 ? "M" : "L";
-      return `${command} ${scaleX(index, data.length).toFixed(2)} ${scaleY(point[key], maxValue).toFixed(2)}`;
+      return `${command} ${scaleX(index, data.length).toFixed(2)} ${scaleY(point[key] ?? 0, maxValue).toFixed(2)}`;
     })
     .join(" ");
 }

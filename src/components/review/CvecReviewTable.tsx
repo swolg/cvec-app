@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, type KeyboardEvent, type MouseEvent, type R
 import { Cell, Column, ColumnResizer, ResizableTableContainer, Row, Table, TableBody, TableHeader } from "react-aria-components/Table";
 import * as VirtualizerPrimitives from "react-aria-components/Virtualizer";
 
+import { findingMatchReviewLabel } from "@/lib/findingMatch";
 import { formatRelativeTimestamp } from "@/lib/format";
 import { findingDisplayTitle, projectReviewLanes, reviewFindingKey } from "@/lib/reviewProjection";
 import { REVIEW_FIELD_REGISTRY, type ReviewFieldId, type ReviewPresentation } from "@/lib/reviewViews";
@@ -91,8 +92,19 @@ function sortToField(sort: ReviewSort): ReviewFieldId { return sort === "recent"
 function renderField(field: ReviewFieldId, item: ReviewFinding, separatePackageColumn: boolean): ReactNode {
   const finding = item.finding;
   if (field === "severity") return <Badge variant={finding.severity === "CRITICAL" ? "destructive" : finding.severity === "HIGH" ? "warning" : "secondary"}>{finding.severity}</Badge>;
-  const title = field === "finding" ? findingDisplayTitle(finding) ?? (separatePackageColumn ? null : finding.packageName) : null;
-  if (field === "finding") return <div className="min-w-0"><p className="truncate font-semibold text-ink">{finding.advisoryId}</p>{title ? <p className="mt-0.5 truncate text-ink-subtle">{title}</p> : null}</div>;
+  if (field === "finding") {
+    const title = findingDisplayTitle(finding) ?? (separatePackageColumn ? null : finding.packageName);
+    const matchLabel = findingMatchReviewLabel(finding.matchEvidence);
+    return (
+      <div className="min-w-0">
+        <div className="flex items-center gap-2">
+          <p className="truncate font-semibold text-ink">{finding.advisoryId}</p>
+          {matchLabel ? <Badge variant="outline">{matchLabel}</Badge> : null}
+        </div>
+        {title ? <p className="mt-0.5 truncate text-ink-subtle">{title}</p> : null}
+      </div>
+    );
+  }
   if (field === "repository") return <span className="block truncate font-medium text-ink">{item.repoName}</span>;
   if (field === "package") return <span className="block truncate text-ink">{finding.packageName} <span className="text-ink-subtle">{finding.packageVersion}</span></span>;
   if (field === "fix") return finding.fixVersion ? <Badge variant="success">{finding.fixVersion}</Badge> : <span className="text-ink-tertiary">No fix</span>;

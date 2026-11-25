@@ -430,6 +430,7 @@ mod tests {
             title: None,
             source_url: None,
             package_url: None,
+            match_evidence: None,
             advisory_details: None,
         }];
         let original = findings.clone();
@@ -566,6 +567,7 @@ mod tests {
             title: None,
             source_url: Some("https://github.com/advisories/GHSA-wc8c-qw6v-h7f6".into()),
             package_url: None,
+            match_evidence: None,
             advisory_details: None,
         };
 

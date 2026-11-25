@@ -1,9 +1,25 @@
 export type RepoStatus = "unknown" | "clean" | "warning" | "critical" | "error" | "scanning";
 export type RepoSourceType = "local" | "github" | "unknown";
-export type Severity = "MEDIUM" | "HIGH" | "CRITICAL";
+export const SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NEGLIGIBLE", "UNKNOWN"] as const;
+export type Severity = (typeof SEVERITIES)[number];
+
+export function isSeverity(value: unknown): value is Severity {
+  return SEVERITIES.some((severity) => severity === value);
+}
 export type ScheduleInterval = "off" | "12h";
 export type ScanRunStatus = "running" | "completed" | "failed" | "unknown";
 export type RepoFindingState = "new" | "open" | "resolved";
+export type FindingMatchKind = "package_version" | "go_symbol" | "upstream" | "go_module" | "nested_workflow" | "local_installation" | "cpe" | "unverified";
+export interface BundledToolEvidence {
+  packageName: string | null;
+  componentFixVersion: string | null;
+}
+
+export interface FindingMatchEvidence {
+  kind: FindingMatchKind;
+  relativePath: string | null;
+  bundledTool?: BundledToolEvidence;
+}
 export type ReviewState = "unreviewed" | "reviewed" | "snoozed";
 export type ReviewSort = "priority" | "severity" | "recent" | "repository" | "package";
 export type RepoFindingIntelMatchKind = "advisory_alias" | "source_url";
@@ -39,15 +55,19 @@ export interface RepoSummary {
   newMedium: number;
   newHigh: number;
   newCritical: number;
+  newOther?: number;
   openMedium: number;
   openHigh: number;
   openCritical: number;
+  openOther?: number;
   resolvedMedium: number;
   resolvedHigh: number;
   resolvedCritical: number;
+  resolvedOther?: number;
   lastScannedAt: string | null;
   lastScanStatus: ScanRunStatus | null;
   lastSuccessfulSourceRevision: string | null;
+  coverageIncomplete?: boolean;
 }
 
 export interface RepoFinding {
@@ -61,12 +81,41 @@ export interface RepoFinding {
   fixVersion: string | null;
   title: string | null;
   sourceUrl: string | null;
+  matchEvidence?: FindingMatchEvidence;
   state: RepoFindingState;
   intel: RepoFindingIntel | null;
   reviewState: ReviewState;
   reviewedAt: string | null;
   snoozeUntil: string | null;
   reviewNote: string | null;
+}
+
+export type ArtifactScanKind = "build_file" | "build_folder" | "sbom";
+
+export interface ArtifactScan {
+  id: number;
+  repoId: number;
+  summary: ArtifactScanSummary;
+}
+
+export interface ArtifactScanSummary {
+  kind: ArtifactScanKind;
+  name: string;
+  digest: string;
+  scannedAt: string;
+  platform: string | null;
+  packageCount: number;
+  findingCount: number;
+  coverageWarnings: string[];
+}
+
+export type ArtifactFinding = Pick<RepoFinding, "fingerprint" | "advisoryId" | "packageName" | "packageVersion" | "packageType" | "severity" | "fixVersion" | "title" | "sourceUrl" | "matchEvidence">;
+
+export interface ArtifactFindings {
+  scanId: number;
+  repoId: number;
+  offset: number;
+  findings: ArtifactFinding[];
 }
 
 export interface RepoFindingIntel {
@@ -156,18 +205,22 @@ export interface RepoScanRun {
   newMedium: number;
   newHigh: number;
   newCritical: number;
+  newOther?: number;
   resolvedMedium: number;
   resolvedHigh: number;
   resolvedCritical: number;
+  resolvedOther?: number;
   sourceRevision?: string | null;
   sourceDirty?: boolean | null;
   packageCount?: number | null;
   reopenedCount?: number;
   warnings?: string[];
+  coverageWarnings?: string[];
   evidenceComplete?: boolean;
   openMedium?: number;
   openHigh?: number;
   openCritical?: number;
+  openOther?: number;
 }
 
 export interface RepoScanComparison {
@@ -177,6 +230,7 @@ export interface RepoScanComparison {
 }
 
 export type RepositoryMonitoringState =
+  | "coverage_incomplete"
   | "scanning"
   | "failed"
   | "never_scanned"
@@ -222,7 +276,7 @@ export interface ReviewOpenRequest {
   };
   origin?: {
     repositoryId: number;
-    section: "overview" | "dependencies" | "history" | "chat" | "settings";
+    section: "overview" | "dependencies" | "history" | "artifacts" | "chat" | "settings";
     scrollAnchor?: string;
   };
 }
@@ -256,6 +310,21 @@ export interface RepoOverview {
   previousScan: RepoScanRun | null;
   findings: RepoFinding[];
   scanHistory: RepoScanRun[];
+  nugetProjects?: NugetProject[];
+}
+
+export interface NugetProject {
+  path: string;
+  frameworks: string[];
+  declarations: NugetDeclaration[];
+  resolutionPath: string | null;
+}
+
+export interface NugetDeclaration {
+  name: string;
+  requirement: string | null;
+  requirementPath: string | null;
+  conditional: boolean;
 }
 
 export type CompanionRuntimePhase =
@@ -1098,9 +1167,11 @@ export interface OverviewSnapshot {
   newMedium: number;
   newHigh: number;
   newCritical: number;
+  newOther?: number;
   openMedium: number;
   openHigh: number;
   openCritical: number;
+  openOther?: number;
   reposWithNewFindings: number;
   lastSuccessfulScanAt: string | null;
 }
@@ -1110,6 +1181,7 @@ export interface RiskTrendPoint {
   medium: number;
   high: number;
   critical: number;
+  other?: number;
 }
 
 export interface WorkspaceStatus {

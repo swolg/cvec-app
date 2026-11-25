@@ -93,17 +93,19 @@ export function RepositoryTable({
                 : providerLabel;
               const isSelected = selectedRepoId === repo.id;
               const risk = repoRisk(repo);
-              const openTotal = repo.openCritical + repo.openHigh + repo.openMedium;
+              const openTotal = repo.openCritical + repo.openHigh + repo.openMedium + (repo.openOther ?? 0);
               const openIssues = issueBreakdown([
                 ["Critical", repo.openCritical],
                 ["High", repo.openHigh],
                 ["Medium", repo.openMedium],
+                ["Other severities", repo.openOther ?? 0],
               ]);
-              const newTotal = repo.newCritical + repo.newHigh + repo.newMedium;
+              const newTotal = repo.newCritical + repo.newHigh + repo.newMedium + (repo.newOther ?? 0);
               const newIssues = issueBreakdown([
                 ["Critical", repo.newCritical],
                 ["High", repo.newHigh],
                 ["Medium", repo.newMedium],
+                ["Other severities", repo.newOther ?? 0],
               ]);
 
               return (
@@ -203,7 +205,7 @@ function repoRisk(repo: RepoSummary): {
   secondary: string;
   variant: "success" | "warning" | "destructive" | "outline" | "secondary";
 } {
-  const openTotal = repo.openCritical + repo.openHigh + repo.openMedium;
+  const openTotal = repo.openCritical + repo.openHigh + repo.openMedium + (repo.openOther ?? 0);
 
   if (repo.status === "error") {
     return {
@@ -236,6 +238,9 @@ function repoRisk(repo: RepoSummary): {
       secondary: "High issues present",
       variant: "warning",
     };
+  }
+  if (repo.openMedium === 0 && openTotal > 0) {
+    return { label: "Open findings", primary: `${openTotal} open`, secondary: "Low, negligible, or unknown severity", variant: "secondary" };
   }
   if (repo.openMedium > 0) {
     return {

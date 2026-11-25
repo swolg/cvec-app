@@ -3,6 +3,7 @@ import { Clock } from "@phosphor-icons/react";
 
 import { getRepoScanComparison } from "@/lib/api";
 import { formatLastScanStatus, formatTimestamp, incompleteInventoryReason } from "@/lib/format";
+import { formatCoverageWarning } from "@/lib/repositoryWorkspace";
 import type { RepoOverview, RepoScanComparison, RepoScanRun } from "@/lib/types";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
@@ -95,13 +96,18 @@ export function RepositoryScanHistory({ detail, selectedRunId, onSelectRun, onOp
                   {selectedRun.status === "completed" ? (
                     <>
                       <div className="mt-1 flex flex-wrap items-center gap-x-3 text-xs text-ink-subtle">
-                        <span>{selectedRun.newCritical + selectedRun.newHigh + selectedRun.newMedium} new</span>
+                        <span>{selectedRun.newCritical + selectedRun.newHigh + selectedRun.newMedium + (selectedRun.newOther ?? 0)} new</span>
                         <ResolutionCount run={selectedRun} onOpenResolved={onOpenResolved} />
                       </div>
                       <p className="mt-2 text-xs text-ink-subtle">{compareMessage}</p>
                     </>
                   ) : null}
                   {selectedRun.sourceRevision ? <p className="mt-2 text-xs text-ink-subtle">Scanned revision {selectedRun.sourceRevision.slice(0, 8)}</p> : null}
+                  {selectedRun.coverageWarnings?.length ? (
+                    <ul className="mt-2 list-disc space-y-1 pl-4 text-xs text-ink-subtle">
+                      {selectedRun.coverageWarnings.map((warning) => <li key={warning}>{formatCoverageWarning(warning, detail.summary.sourceType)}</li>)}
+                    </ul>
+                  ) : null}
                   {selectedRun.errorMessage ? <p className="mt-2 whitespace-pre-wrap text-xs text-severity-critical [overflow-wrap:anywhere]">{selectedRun.errorMessage}</p> : null}
                 </>
               ) : (
@@ -142,7 +148,7 @@ export function RepositoryScanHistory({ detail, selectedRunId, onSelectRun, onOp
               {completed ? (
                 <>
                   <span>Packages <strong className="font-medium text-ink">{run.packageCount ?? "Not recorded"}</strong></span>
-                  <span>New <strong className="font-medium text-ink">+{run.newCritical + run.newHigh + run.newMedium}</strong></span>
+                  <span>New <strong className="font-medium text-ink">+{run.newCritical + run.newHigh + run.newMedium + (run.newOther ?? 0)}</strong></span>
                   <ResolutionCount run={run} onOpenResolved={run.id === selectedRunId ? undefined : onOpenResolved} />
                 </>
               ) : null}
@@ -155,6 +161,7 @@ export function RepositoryScanHistory({ detail, selectedRunId, onSelectRun, onOp
               </details>
             ) : null}
             {run.warnings?.length ? <p className="mt-2 text-xs text-ink-subtle">{run.warnings.length} scanner warning{run.warnings.length === 1 ? "" : "s"}</p> : null}
+            {run.coverageWarnings?.length ? <p className="mt-2 text-xs text-ink-subtle">Incomplete package coverage</p> : null}
             {completed && run.evidenceComplete === false ? <p className="mt-2 text-xs text-ink-subtle">This scan has incomplete historical evidence.</p> : null}
           </article>
         );
@@ -164,7 +171,7 @@ export function RepositoryScanHistory({ detail, selectedRunId, onSelectRun, onOp
 }
 
 function ResolutionCount({ run, onOpenResolved }: { run: RepoScanRun; onOpenResolved?: (runId: number) => void }) {
-  const count = run.resolvedCritical + run.resolvedHigh + run.resolvedMedium;
+  const count = run.resolvedCritical + run.resolvedHigh + run.resolvedMedium + (run.resolvedOther ?? 0);
   if (run.evidenceComplete && count > 0 && onOpenResolved) {
     return (
       <Button

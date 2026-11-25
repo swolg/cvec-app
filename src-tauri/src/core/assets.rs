@@ -114,7 +114,7 @@ fn scan_workflows(root: &AnchoredRoot, repo_id: i64, assets: &mut AssetMap) {
     };
     if let Ok(names) = directory.entry_names() {
         scan_workflow_files(
-            names,
+            names.map_while(Result::ok),
             |name| directory.entry(name, false)?.open(),
             repo_id,
             assets,

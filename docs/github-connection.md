@@ -2,6 +2,8 @@
 
 CVEC discovers local Git repositories under the selected folder. You can clone a private repository with your usual Git credentials and place it under that folder. Public GitHub URLs also work anonymously. Configure your own GitHub App for sign-in, authenticated API limits and direct access to selected private repositories. Requests go directly from CVEC to GitHub. See [first-run setup](getting-started.md#first-run) for local discovery.
 
+For a linked repository, CVEC downloads the default branch's exact commit into a temporary scan directory and verifies file contents against the commit's Git objects. Coverage details identify unavailable submodule contents, Git LFS objects, and unresolved symbolic links. A local checkout can supply those files and resolved dependency metadata such as NuGet lockfiles.
+
 ## Register and install your GitHub App
 
 1. In GitHub **Settings → Developer settings → GitHub Apps**, register an app under your account or organization. Give it a name and a homepage URL, such as the owning account's profile. Enable **Device Flow**. Leave **Request user authorization (OAuth) during installation** and **Webhook → Active** off. [GitHub registration guide](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
